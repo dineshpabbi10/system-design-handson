@@ -1,0 +1,108 @@
+site_name: System Design with Kafka
+site_description: Hands-on guide to building async, event-driven systems with Kafka — outbox, sagas, idempotency, and distributed transactions.
+site_url: ""
+docs_dir: docs
+
+nav:
+  - Home: index.md
+  - Fundamentals:
+      - Messaging & Event-Driven Basics: 01-fundamentals/messaging-basics.md
+      - Kafka Architecture: 01-fundamentals/kafka-architecture.md
+      - Local Environment Setup: 01-fundamentals/setup.md
+  - Core Concepts:
+      - Delivery Semantics: 02-concepts/delivery-semantics.md
+      - Idempotency: 02-concepts/idempotency.md
+      - Distributed Transactions: 02-concepts/distributed-transactions.md
+      - The Saga Pattern: 02-concepts/saga.md
+      - The Transactional Outbox Pattern: 02-concepts/outbox.md
+      - Event Ordering: 02-concepts/ordering.md
+      - Scaling Consumers & Backpressure: 02-concepts/scaling-consumer-groups.md
+      - "Failure Handling: Retries & DLQ": 02-concepts/failure-handling.md
+      - Schema Evolution & Registry: 02-concepts/schema-evolution.md
+      - Exactly-Once Semantics: 02-concepts/exactly-once.md
+      - Event Sourcing & CQRS: 02-concepts/event-sourcing-cqrs.md
+      - Observability for Async Systems: 02-concepts/observability.md
+  - Hands-On Projects:
+      - The Project Ladder: 03-projects/overview.md
+      - P1 · Hello Kafka: 03-projects/p01-hello-kafka.md
+      - P2 · Consumer Groups & Scaling: 03-projects/p02-consumer-groups.md
+      - P3 · Idempotent Payment API: 03-projects/p03-idempotency.md
+      - P4 · Transactional Outbox (Polling Publisher): 03-projects/p04-outbox-polling.md
+      - P5 · Outbox with Debezium CDC: 03-projects/p05-outbox-cdc.md
+      - P6 · Saga by Choreography: 03-projects/p06-saga-choreography.md
+      - P7 · Saga by Orchestration: 03-projects/p07-saga-orchestration.md
+      - P8 · Retries, Backoff & DLQ: 03-projects/p08-reliability-dlq.md
+      - P9 · Schema Registry & Evolution: 03-projects/p09-schema-registry.md
+      - P10 · Kafka Transactions & Exactly-Once: 03-projects/p10-exactly-once.md
+      - P11 · Event Sourcing Bank: 03-projects/p11-event-sourcing.md
+      - "P12 · Capstone: E-Commerce Platform": 03-projects/p12-capstone.md
+  - Resources:
+      - Glossary: 04-resources/glossary.md
+      - Troubleshooting & Pitfalls: 04-resources/troubleshooting.md
+      - Further Reading: 04-resources/further-reading.md
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - def_list
+  - tables
+  - footnotes
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+copyright: Built for hands-on system design learning — Python + FastAPI + Kafka.
