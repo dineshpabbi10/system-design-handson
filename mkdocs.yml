@@ -1,6 +1,6 @@
 site_name: System Design with Kafka
 site_description: Hands-on guide to building async, event-driven systems with Kafka — outbox, sagas, idempotency, and distributed transactions.
-site_url: ""
+site_url: "https://dineshpabbi10.github.io/system-design-handson/"
 docs_dir: docs
 
 nav:
