@@ -188,5 +188,11 @@ model for autoscaling.
 - [ ] You produced a rebalance storm and can describe it from logs
 - [ ] You can explain why lag + rebalance looks the way it does in `--describe`
 
+## Learn more
+
+- **Docs** — [Confluent — Consumer group rebalancing](https://www.confluent.io/learn/kafka-rebalancing) — rebalance triggers, static membership, `max.poll.interval`.
+- **Watch** — [Everything you wanted to know about a Kafka consumer group, but were afraid to ask](https://www.confluent.io/kafka-summit-lon19/everything-you-wanted-to-know-kafka-afraid/) (Matthias J. Sax) — the protocol details behind the "5 consumers for 4 partitions" trap.
+- **Watch** — [Apache Kafka 101 — Consumers module](https://developer.confluent.io/courses/apache-kafka/events/) — consumer groups and offsets, gently.
+
 Next: **[P3 · Idempotent payment API](p03-idempotency.md)** — absorb duplicates so
 at-least-once stops being a piazza rehearsal.

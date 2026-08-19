@@ -202,5 +202,11 @@ psql -c "SELECT count(*) FROM payments WHERE order_id='o1';"   # must be 1
 - [ ] A redelivered Kafka event is skipped by the `processed_events` table
 - [ ] You can explain why "INSERT ... ON CONFLICT" is the guard, not a SELECT check
 
+## Learn more
+
+- **Read** — [How Stripe Works: Idempotency](https://stripe.com/blog/idempotency) (Brandur Leach) — the API you're reimplementing, flaws and all.
+- **Docs** — [Stripe API — Idempotent requests](https://docs.stripe.com/api/idempotent_requests) — the exact KEY header/response semantics to mirror.
+- **Read** — [Kafka Deduplication Patterns](https://www.lydtechconsulting.com/blog/kafka-deduplication-patterns---part-1-of-2) — reader-side dedup options when the API isn't yours to fix.
+
 Next: **[P4 · Transactional Outbox (polling publisher)](p04-outbox-polling.md)** —
 the moment DB writes and Kafka become one story.

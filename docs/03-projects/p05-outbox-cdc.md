@@ -200,5 +200,11 @@ Watch the connector's snapshot phase in logs when the topic first starts flowing
 - [ ] You have seen and cleaned up an abandoned replication slot
 - [ ] You wrote a one-paragraph "polling vs CDC" decision note for your team
 
+## Learn more
+
+- **Docs** — [Debezium — Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) — the transformation at the heart of this project, reference form.
+- **Read** — [Reliable Microservices Data Exchange with the Outbox Pattern](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/) — a production walkthrough of exactly this architecture.
+- **Watch** — [Ins and Outs of the Outbox Pattern](https://www.youtube.com/watch?v=PkrzOR_tIQI) (Gunnar Morling) — Debezium outbox live, with the failure analysis.
+
 Next: **[P6 · Saga by Choreography](p06-saga-choreography.md)** — multi-service
 workflow, first decentralized.

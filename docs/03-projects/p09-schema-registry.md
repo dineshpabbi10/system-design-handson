@@ -165,5 +165,11 @@ curl -X POST http://localhost:8081/compatibility/subjects/orders-value/versions 
 - [ ] A violating schema is rejected at `compatibility/` before deploy
 - [ ] Corrupt bytes reach the DLQ labeled `invalid`, partition keeps moving
 
+## Learn more
+
+- **Docs** — [Schema Registry — Key Concepts (video course)](https://developer.confluent.io/courses/schema-registry/key-concepts) — subjects, compatibility and serdes in short modules.
+- **Docs** — [Schema Registry serdes — Avro/Protobuf/JSON](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html) — reference for the `value.schema` plumbing this project exercises.
+- **Read** — [Multiple Event Types in the Same Kafka Topic](https://www.confluent.io/blog/multiple-event-types-in-the-same-kafka-topic/) — the other half of schema design: what belongs in one subject.
+
 Next: **[P10 · Exactly-Once & Kafka Transactions](p10-exactly-once.md)** — the
 final word on duplicate-freedom, honestly stated.

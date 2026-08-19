@@ -192,4 +192,11 @@ to join against the source DB to understand a dead record:
     - **Observability**: every replay logs trace id + count; DLQ rate is an
       alertable metric, not just dead-letter presence.
 
+## Learn more
+
+- **Docs** — [Confluent — Introduction to Kafka dead letter queues](https://www.confluent.io/learn/kafka-dead-letter-queue) — a full guide to DLQ design, monitoring and retry strategies.
+- **Read** — [Reliable Microservices Data Exchange with the Outbox Pattern](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/) — the same failure taxonomy (service down, duplicate publishes, unprocessable messages, rebalancing) motivating the outbox, which your DLQ strategy complements.
+- **Watch** — [Reliable Message Delivery with Apache Kafka (Kafka Summit SF 2018)](https://www.confluent.io/kafka-summit-sf18/reliable-message-delivery-with-apache-kafka/) — failure handling from both sides of the broker.
+- **Docs** — [Consumer behavior in case of failures (Kafka docs)](https://kafka.apache.org/documentation/#consumerconfigs_max.poll.interval.ms) — the off-by-default configs (`max.poll.interval.ms`, session timeout, retries) that turn silent failures into visible ones.
+
 Next: [Schema Evolution & Registry](schema-evolution.md)

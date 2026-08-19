@@ -190,5 +190,11 @@ Stale unpublished rows = relay dead. This query is your "pipeline is alive" prob
 - [ ] Duplicate deliveries produce zero duplicate stock effects (SQL-proof)
 - [ ] You can explain "the outbox made the broker optional" in one sentence
 
+## Learn more
+
+- **Read** — [microservices.io — Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) — the pattern this project is built on.
+- **Read** — [The Dual-Write Problem](https://www.confluent.io/blog/dual-write-problem/) — the failure modes the outbox eliminates (or moves).
+- **Watch** — [Ins and Outs of the Outbox Pattern](https://www.youtube.com/watch?v=PkrzOR_tIQI) (Gunnar Morling) — the polling-publisher design's edge cases, in video.
+
 Next: **[P5 · Outbox with Debezium CDC](p05-outbox-cdc.md)** — the relay you never
 write.

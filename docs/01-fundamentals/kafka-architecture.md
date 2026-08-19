@@ -190,5 +190,12 @@ flowchart LR
     from there. Data is removed only by **retention** (time/size), never by
     consumption. Fewer consumers = more lag, not less data.
 
+## Learn more
+
+- **Watch** — [Apache Kafka 101 (Confluent Developer)](https://developer.confluent.io/courses/apache-kafka/events/) — modules on producers, consumers, brokers, partitions, replication and KRaft map 1:1 to this page.
+- **Watch** — [Kafka Summit's best-rated internals talks](https://kafka.apache.org/community/videos/) — the official curated list (produce/fetch API internals, replication hardening, Kafka cloud-native).
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — the theoretical skeleton behind brokers, logs and partitions.
+- **Docs** — [Apache Kafka documentation — Core concepts](https://kafka.apache.org/documentation/) — the reference for every term used on this page.
+
 Next: [Local Environment Setup](setup.md) — get Kafka running in Docker and see these
 concepts with your own eyes.

@@ -194,5 +194,12 @@ flowchart TB
     Never: silently process the new body under the old key — that breaks replay
     semantics and can double-charge.
 
+## Learn more
+
+- **Read** — [How Stripe Works: Idempotency](https://stripe.com/blog/idempotency) (Brandur Leach) — the canonical write-up of an idempotency-key table with its subtle failure analysis.
+- **Read** — [Idempotent Consumers and Kafka: Deduplicating Every Data Case](https://www.lydtechconsulting.com/blog/kafka-deduplication-patterns---part-1-of-2) — side-table, store-before-commit and dedup-in-the-datalake patterns compared.
+- **Docs** — [Stripe API — Idempotent requests](https://docs.stripe.com/api/idempotent_requests) — what the semantics of an idempotency key are, from the API that defined them.
+- **Watch** — [Reliable Message Delivery with Apache Kafka (Kafka Summit SF 2018)](https://www.confluent.io/kafka-summit-sf18/reliable-message-delivery-with-apache-kafka/) — the consumer side: why retries happen and what "safe processing" means.
+
 Next: [Distributed Transactions](distributed-transactions.md) — and why the industry
 avoids 2PC in favor of patterns like outbox and saga.

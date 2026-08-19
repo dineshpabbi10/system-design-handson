@@ -184,5 +184,11 @@ Kill the consumer, produce 10 more, restart → it resumes at the committed offs
 - [ ] You have measured, then explained, consumer lag
 - [ ] You killed something and observed exactly one of the failure modes above
 
+## Learn more
+
+- **Docs** — [Confluent Developer — Python client guide](https://developer.confluent.io/languages/python/) — `Producer`/`Consumer`/`AdminClient` API this project wires up by hand.
+- **Watch** — [Apache Kafka 101 — "Your First Kafka Application" module](https://developer.confluent.io/courses/apache-kafka/events/) — the same hello-world, video form.
+- **Read** — [The Log: What every software engineer should know](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction) (Jay Kreps) — why the trivially-simple API is a big deal.
+
 Next: **[P2 · Consumer groups & scaling](p02-consumer-groups.md)** — parallelism,
 rebalance, and why "5 consumers for 4 partitions" is a trap.

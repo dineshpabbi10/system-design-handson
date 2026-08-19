@@ -119,4 +119,10 @@ The "single durable store owns the intent" trick is the essence of the
     safe. You get ACID where it's local, eventual consistency across services, and
     availability — the industry answer.
 
+## Learn more
+
+- **Read** — [Life Beyond Distributed Transactions](https://queue.acm.org/detail.cfm?id=3025012) (Pat Helland, ACM Queue 2016) — the definitive argument that the *only* safe protocol is "expand the form of the message"; the intellectual parent of the outbox and saga patterns.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 9 "Consistency and Consensus" — why 2PC fails, and the alternatives.
+- **Watch** — [Turning the Database Inside Out (talk recording)](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Martin Kleppmann) — frames exactly the problem this page's patterns solve: coordinating writes across two stores in a distributed world.
+
 Next: [The Saga Pattern](saga.md)

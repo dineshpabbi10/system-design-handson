@@ -218,5 +218,11 @@ loop.
 - [ ] You maintain a `runbook.md` per DLQ event type (3 rows minimum) — the art of
       the repair loop
 
+## Learn more
+
+- **Docs** — [Confluent — Introduction to Kafka dead letter queues](https://www.confluent.io/learn/kafka-dead-letter-queue) — retry topic, DLQ and alerting design in one guide.
+- **Watch** — [Reliable Message Delivery with Apache Kafka (Kafka Summit SF 2018)](https://www.confluent.io/kafka-summit-sf18/reliable-message-delivery-with-apache-kafka/) — where duplicate/poison messages come from, end to end.
+- **Docs** — [Kafka — consumer configs](https://kafka.apache.org/documentation/#consumerconfigs_max.poll.interval.ms) — `max.poll.interval.ms`, `delivery.timeout.ms` and retries as the knobs your [failure-handling](../02-concepts/failure-handling.md) design reasoned about.
+
 Next: **[P9 · Schema Registry & Evolution](p09-schema-registry.md)** — contracts,
 before they break you silently.

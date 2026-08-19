@@ -135,4 +135,11 @@ Does the consumer touch anything outside Kafka?
     only guarantee broker-side atomicity; for systems touching anything else,
     the "no double apply" invoice is always paid at the DB/API constraint.
 
+## Learn more
+
+- **Read** — [Exactly-once Semantics Are Possible: Here's How Kafka Does It](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/) (Neha Narkhede) — the original EOS design (IDEMPOTENT/TRANSACTIONAL producer, read-process-write loop, zombie fencing).
+- **Watch** — [Introducing Exactly-Once Semantics in Apache Kafka](https://www.confluent.io/online-talk/introducing-exactly-once-semantics-in-apache-kafka) (Apurva Mehta & Jason Gustafson) — the deep 40-minute design walkthrough.
+- **Watch** — [A Pragmatic Guide to Kafka's Exactly-Once Semantics](https://videos.confluent.io/watch/s4BpiPSAfC2S4MMYwRfY3J) (Bay Area meetup) — "where EOS actually helps" vs. "where it doesn't", with Kafka Streams.
+- **Docs** — [Kafka documentation — semantics](https://kafka.apache.org/documentation/#semantics) — the spec-curve contract, straight from the source.
+
 Next: [Event Sourcing & CQRS](event-sourcing-cqrs.md)

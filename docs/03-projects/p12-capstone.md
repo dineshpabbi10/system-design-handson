@@ -226,6 +226,12 @@ per-consumer-group lag, DLQ count, saga `running` age, outbox staleness.
 - [ ] You can whiteboard the whole architecture — services, topics, keys —
       in under 3 minutes, from memory.
 
+## Learn more
+
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net) — by this point the entire book is fair game; this project is a survey of its themes.
+- **Watch** — [Kafka Summit's most-watched talks](https://kafka.apache.org/community/videos/) — production talks on large clusters, exactly-once and event-streaming architectures at scale.
+- **Read** — [The Log: What every software engineer should know](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction) (Jay Kreps) — the paper this whole ladder rests on; reread it now that every pattern on it has been built by hand.
+
 That's the ladder. The patterns now live in your hands: **outbox for atomicity,
 idempotency for duplicates, saga for workflows, DLQ for resilience, schema for
 contracts, traces for truth.** Build something real with them.

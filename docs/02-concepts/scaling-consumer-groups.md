@@ -177,4 +177,11 @@ rebakes are safe.
     analysis that implies). This is why choosing the initial partition count
     wisely (and monitoring utilization) is a design decision, not a config knob.
 
+## Learn more
+
+- **Watch** — [Everything you wanted to know about a Kafka consumer group, but were afraid to ask](https://www.confluent.io/kafka-summit-lon19/everything-you-wanted-to-know-kafka-afraid/) (Matthias J. Sax, Kafka Summit London 2019) — the rebalance protocol and cooperative rebalancing, from the person who wrote large parts of it.
+- **Docs** — [Confluent — Consumer group rebalancing](https://www.confluent.io/learn/kafka-rebalancing) — rebalance triggers, static membership and `max.poll.interval` interaction.
+- **Watch** — [Kafka Summit's best-rated scalability talks](https://kafka.apache.org/community/videos/) — partition scaling (including 200k-partition clusters) among the curated list.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — offset management and partitioning trade-offs.
+
 Next: [Failure Handling: Retries & DLQ](failure-handling.md)

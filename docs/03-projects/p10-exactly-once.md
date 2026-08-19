@@ -179,5 +179,11 @@ Consumer({... "isolation.level": "read_committed"})
 For the belt-and-braces combo (transactions + outbox), revisit P4 with this new
 eye — the pair is the strongest reliable-publish pattern in this book.
 
+## Learn more
+
+- **Read** — [Exactly-once Semantics Are Possible: Here's How Kafka Does It](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/) (Neha Narkhede) — IDEMPOTENT vs. TRANSACTIONAL, and the zombie fencing this project implements.
+- **Watch** — [Introducing Exactly-Once Semantics in Apache Kafka](https://www.confluent.io/online-talk/introducing-exactly-once-semantics-in-apache-kafka) (Apurva Mehta & Jason Gustafson) — the design in full detail.
+- **Watch** — [A Pragmatic Guide to Kafka's EOS](https://videos.confluent.io/watch/s4BpiPSAfC2S4MMYwRfY3J) — where transactions pay off and where `idempotence` alone suffices, the exact judgment call P10 makes.
+
 Next: **[P11 · Event-Sourced Bank](p11-event-sourcing.md)** — a different paradigm
 where the event log becomes the truth.

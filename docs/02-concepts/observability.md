@@ -158,5 +158,12 @@ script, DLQ alert, trace id on events) and prove a stuck flow with it.
     Plus a trivially testable convention: every producer emits ≥ these headers;
     CS/validation gate rejects topics without them.
 
+## Learn more
+
+- **Docs** — [OpenTelemetry — Python documentation](https://opentelemetry.io/docs/languages/python/) — tracing setup, context propagation and exporters for the exact stack the ladder's P5 uses.
+- **Docs** — [W3C Trace Context](https://www.w3.org/TR/trace-context/) — the `traceparent`/`tracestate` headers every message-carried trace relies on; worth reading once, forever.
+- **Watch** — [Turning the Database Inside Out (talk recording)](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Martin Kleppmann) — observability as the flip side of event-driven systems: if the log is the truth, reading it becomes debugging.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — offset lags and reprocessing as diagnostic tools, in depth.
+
 Next, the fun part: start [The Project Ladder](../03-projects/overview.md) — every
 concept above gets built, broken, and repaired by hand.

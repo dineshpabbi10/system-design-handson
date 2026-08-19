@@ -179,4 +179,11 @@ this and then wires a Kafka projection.
        outbox + projection (+) modeling carry a learning tax; with no replay,
        audit, or business-history requirement, plain CRUD is pragmatically safer.
 
+## Learn more
+
+- **Read** — [Event Sourcing (Martin Fowler)](https://martinfowler.com/eaaDev/EventSourcing.html) and [CQRS (Martin Fowler)](https://martinfowler.com/bliki/CQRS.html) — the distilled definitions, and when each stops paying off.
+- **Watch** — [Turning the Database Inside Out (talk recording)](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Martin Kleppmann) — event sourcing, views and materialization as the natural way to model systems; the talk this site's philosophy descends from.
+- **Watch** — [Event Sourcing and CQRS with Kafka Streams (Confluent Developer)](https://developer.confluent.io/courses/microservices/the-transactional-outbox-pattern/) — pattern mechanics in the Kafka ecosystem.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — the event-sourcing-versus-Kafka relationship stated precisely.
+
 Next: [Observability for Async Systems](observability.md)

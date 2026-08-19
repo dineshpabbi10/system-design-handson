@@ -210,4 +210,11 @@ Rules that never break you:
     - if you can't coordinate: new topic/new event type, old one retired on a
       deadline — registry "soft delete" + retention.
 
+## Learn more
+
+- **Docs** — [Confluent Schema Registry — Key Concepts (video course)](https://developer.confluent.io/courses/schema-registry/key-concepts) — serdes, compatibility levels and client integration in ~6 short modules.
+- **Docs** — [Schema Registry serdes — Avro/Protobuf/JSON 101](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html) — what `value.schema` actually does on the wire vs. in the registry.
+- **Read** — [Multiple Event Types in the Same Kafka Topic](https://www.confluent.io/blog/multiple-event-types-in-the-same-kafka-topic/) — schema-evolution-adjacent topic design for evolving events.
+- **Docs** — [Debezium — Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) — a production source of evolving schemas worth studying alongside this page.
+
 Next: [Exactly-Once Semantics](exactly-once.md)

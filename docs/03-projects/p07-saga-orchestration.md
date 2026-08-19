@@ -185,5 +185,11 @@ now lives in one table.
 - [ ] Compensation matrix executes exactly once per failure
 - [ ] One paragraph comparing P6 vs P7 written from *measured* experience
 
+## Learn more
+
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 9 "Consistency and Consensus" — the coordination problem sagas exist to sidestep, and when orchestration is worth it.
+- **Read** — [Sagas (original 1987 paper)](http://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) — the semantics of compensating a partially-committed saga.
+- **Watch** — [The transactional outbox pattern (Confluent Developer)](https://developer.confluent.io/courses/microservices/the-transactional-outbox-pattern/) — state machines over event streams in video form.
+
 Next: **[P8 · Retries, Backoff & DLQ](p08-reliability-dlq.md)** — the failure
 ladder that keeps sagas alive under dirty data.

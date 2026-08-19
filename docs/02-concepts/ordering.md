@@ -158,4 +158,11 @@ account_id + shard segment).
       across partitions. Same rule both times: **key = the entity whose order
       matters**.
 
+## Learn more
+
+- **Read** — [How to Choose the Number of Topics/Partitions in a Kafka Cluster](https://www.confluent.io/blog/how-choose-number-topics-partitions-kafka-cluster/) (Jun Rao) — the authoritative trade-off matrix behind "one partition per order key".
+- **Watch** — [Multiple Event Types in the Same Kafka Topic (Confluent)](https://www.confluent.io/blog/multiple-event-types-in-the-same-kafka-topic/) — when *not* to split topics, the flip side of per-entity topics.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — the fundamental trade-off between ordering and parallelism, in theory form.
+- **Docs** — [Kafka documentation — Logs and partition ordering](https://kafka.apache.org/documentation/#intro_consumers) — the official statement of per-partition ordering.
+
 Next: [Scaling Consumers & Backpressure](scaling-consumer-groups.md)

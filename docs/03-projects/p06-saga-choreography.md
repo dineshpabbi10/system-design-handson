@@ -178,5 +178,11 @@ inventory: **released exactly as many units as reserved**.
 **Choreography verdict time:** write 3 sentences on when you'd *still* choose
 choreography vs when you'd refuse it. Then go build the alternative.
 
+## Learn more
+
+- **Read** — [microservices.io — Saga pattern](https://microservices.io/patterns/data/saga.html) (Chris Richardson) — choreography vs. orchestration, with the failure scenarios each one couples you to.
+- **Read** — [Sagas (original 1987 paper)](http://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) — compensable/pivot/retriable steps, the vocabulary this project uses.
+- **Watch** — [The transactional outbox pattern (Confluent Developer)](https://developer.confluent.io/courses/microservices/the-transactional-outbox-pattern/) — routing slip + events, the mechanism under every saga step.
+
 Next: **[P7 · Saga by Orchestration](p07-saga-orchestration.md)** — the same saga,
 with one durable brain.

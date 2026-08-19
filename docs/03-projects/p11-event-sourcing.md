@@ -218,5 +218,11 @@ straight face.
 - [ ] `replay.sh` rebuilds balance_view and matches control values
 - [ ] You can explain "events = truth, projections = opinions" to a non-CS friend
 
+## Learn more
+
+- **Read** — [Event Sourcing (Martin Fowler)](https://martinfowler.com/eaaDev/EventSourcing.html) — events as truth, snapshots as performance; the theory behind the bank.
+- **Watch** — [Turning the Database Inside Out (talk recording)](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Martin Kleppmann) — event-sourced systems and materialized views, the philosophical base of this project.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — replay, versioning and derived state, precisely.
+
 Next: **[P12 · Capstone: E-Commerce Platform](p12-capstone.md)** — every piece,
 one system.

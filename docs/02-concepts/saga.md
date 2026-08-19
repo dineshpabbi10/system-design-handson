@@ -184,4 +184,11 @@ diagram from this guide, remember this one.
     has side effects (money moved, email sent), it can *not* be its own
     compensation — those need distinct compensating operations.
 
+## Learn more
+
+- **Read** — [Sagas (original 1987 paper)](http://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) (Garcia-Molina & Salem) — where the pattern got its name and its exact guarantees ("compensable", "pivot", "retriable" steps).
+- **Read** — [microservices.io — Saga pattern](https://microservices.io/patterns/data/saga.html) (Chris Richardson) — choreography vs. orchestration comparison and when each leaks.
+- **Watch** — [The transactional outbox pattern (Confluent Developer)](https://developer.confluent.io/courses/microservices/the-transactional-outbox-pattern/) — the mechanism underneath most saga steps, in video.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 9 "Consistency and Consensus" — sagas as the anti-2PC argument, in depth.
+
 Next: [The Transactional Outbox Pattern](outbox.md) — the foundation under every saga.

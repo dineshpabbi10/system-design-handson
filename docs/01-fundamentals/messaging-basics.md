@@ -148,5 +148,12 @@ in events.
     4. **Durability as audit** — the record is a lasting fact ("this happened, in
        this order, at this time"), not a transient request.
 
+## Learn more
+
+- **Watch** — [Apache Kafka 101 (Confluent Developer)](https://developer.confluent.io/courses/apache-kafka/events/) — the 12-video fundamentals course presented by Tim Berglund; perfect pairing for this page's sections.
+- **Read** — [The Log: What every software engineer should know about real-time data's unifying abstraction](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction) (Jay Kreps) — why the log is the core abstraction and where queues/pub-sub fit.
+- **Watch** — [Turning the Database Inside Out](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Martin Kleppmann, Strange Loop) — the mindset shift from state to streams; [transcript](https://martin.kleppmann.com/2015/03/04/turning-the-database-inside-out.html).
+- **Docs** — [Apache Kafka documentation — Introduction](https://kafka.apache.org/documentation/#introduction) — the official "what is a message" framing.
+
 Next: [Kafka Architecture](kafka-architecture.md) — topics, partitions, offsets, and
 why "log" is the right mental model.

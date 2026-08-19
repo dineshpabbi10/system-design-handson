@@ -178,4 +178,11 @@ Idempotent consumers process **facts**, not commands. See
   idempotency (next page) or Kafka transactions (P10).
 - Never auto-commit in a business consumer. Take ownership of offsets.
 
+## Learn more
+
+- **Docs** — [Kafka documentation — Message delivery semantics](https://kafka.apache.org/documentation/#semantics) — the authoritative statement of at-most-once / at-least-once / exactly-once and where "once" actually means "once *per committed offset*".
+- **Read** — [Exactly-once Semantics Are Possible: Here's How Kafka Does It](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/) (Neha Narkhede) — the "B is different from C" framing used throughout this page.
+- **Watch** — [Reliable Message Delivery with Apache Kafka (Kafka Summit SF 2018)](https://www.confluent.io/kafka-summit-sf18/reliable-message-delivery-with-apache-kafka/) — the design-space walkthrough from producers through to consumers, in 26 minutes.
+- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — idempotence and exactly-once trade-offs in depth.
+
 Next: [Idempotency](idempotency.md)

@@ -215,4 +215,12 @@ to write the "insert then publish" version once you know this pattern.
     history** (e.g. `OrderCancelled` before `OrderPlaced`). Ordering is a factual
     guarantee (p. [ordering](ordering.md)) — never base it on clocks.
 
+## Learn more
+
+- **Read** — [The Dual-Write Problem](https://www.confluent.io/blog/dual-write-problem/) — the failure modes an outbox exists to remove, dissected.
+- **Watch** — [Ins and Outs of the Outbox Pattern](https://www.youtube.com/watch?v=PkrzOR_tIQI) (Gunnar Morling, Devoxx UK) — the trade-offs and edge cases (ordering, idempotency, timeouts) beyond the happy path, with Debezium live.
+- **Read** — [Revisiting the Outbox Pattern](https://www.morling.dev/blog/revisiting-the-outbox-pattern/) — a no-DB-trigger alternative that avoids lock contention on the outbox table.
+- **Docs** — [Debezium — Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) — the routing transformation in its usual production shape; [blog version](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/) explains the motivating example.
+- **Read** — [microservices.io — Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) — the pattern's home page.
+
 Next: [Event Ordering](ordering.md)

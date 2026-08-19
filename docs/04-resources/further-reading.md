@@ -1,7 +1,49 @@
 # Further Reading
 
-Curated, ordered by value-per-minute for this learning path. Read after the
-corresponding project, not before.
+Curated, ordered by value-per-minute for this learning path. Read (or watch)
+after the corresponding project, not before. Every concept and project page also
+links its own **Learn more** items — this page is the full master index.
+
+## Watch
+
+The talks and courses below pair with the pages they're listed besides; the
+three that earn repeated re-watching are starred.
+
+### Courses & overviews
+
+- **Apache Kafka 101** — Confluent Developer (Tim Berglund), 12 short videos.
+  The video twin of 01-fundamentals: events, topics, brokers, producers,
+  consumers, offsets, consumer groups. Start here if you prefer video to text.
+- **The Transactional Outbox Pattern** — Confluent Developer (Wade Waldron),
+  the video twin of outbox + saga (P4–P7).
+
+### Talks
+
+- **Turning the Database Inside Out** ★ — Martin Kleppmann (Strange Loop),
+  talk + [transcript](https://martin.kleppmann.com/2015/03/04/turning-the-database-inside-out.html).
+  The philosophical foundation of event sourcing, outbox and materialized views.
+  Watch before starting the project ladder.
+- **Ins and Outs of the Outbox Pattern** ★ — Gunnar Morling (Devoxx UK), the
+  edge cases (ordering, idempotency, timeouts) of every outbox you will build.
+- **Reliable Message Delivery with Apache Kafka** — Uber (Kafka Summit SF 2018):
+  the whole reliability design space in 26 minutes — the perfect recap of
+  delivery-semantics + failure-handling (P2, P8).
+- **Everything you wanted to know about a Kafka consumer group, but were afraid
+  to ask** — Matthias J. Sax (Kafka Summit London 2019): rebalance protocol,
+  cooperative rebalancing, static membership (P2).
+- **Introducing Exactly-Once Semantics in Apache Kafka** — Apurva Mehta & Jason
+  Gustafson: the EOS design, 40 minutes (P10).
+- **A Pragmatic Guide to Apache Kafka's Exactly-Once Semantics** — Bay Area
+  meetup: where EOS pays off and where idempotence alone suffices (P10).
+- [Kafka Summit's curated talk list](https://kafka.apache.org/community/videos/)
+  — the official archive sorted by rating; mining it after P12 is a course in
+  itself.
+
+### Essential reading (recurring)
+
+- **Designing Data-Intensive Applications** — Kleppmann. Book (any format) +
+  [chapter list](http://dataintensive.net). Chapters 9–11 are the skeleton of
+  this course.
 
 ## Kafka core (after P1–P2)
 
@@ -81,15 +123,17 @@ corresponding project, not before.
 
 ## Reading sequence that matches this course
 
-| When | Read |
-|------|------|
-| Before P1 | The Log (Kreps) — skim |
-| After P3 | Stripe idempotency post + DDIA "trouble with distributed systems" |
-| After P4/P5 | Outbox pattern (Richardson) + Debezium docs |
-| After P6/P7 | Richardson saga posts + Fowler CQRS |
-| After P9 | Registry compatibility docs |
-| After P10 | Kafka EOS docs (now they make sense) |
-| After P11 | Fowler event sourcing + versioned events |
-| After P12 | DDIA consistency chapters + cloud case studies |
+| When | Read | Watch |
+|------|------|-------|
+| Before P1 | The Log (Kreps) — skim | Kafka 101 (ep. 1–3) |
+| After P2 | — | Consumer group talk (Sax) |
+| After P3 | Stripe idempotency post + DDIA "trouble with distributed systems" | — |
+| After P4/P5 | Outbox pattern (Richardson) + Debezium docs | Outbox talk (Morling) |
+| After P6/P7 | Richardson saga posts + Fowler CQRS | Outbox pattern course |
+| After P8 | — | Reliable Message Delivery (Uber) |
+| After P9 | Registry compatibility docs | Schema Registry 101 course |
+| After P10 | Kafka EOS docs (now they make sense) | EOS talks (Mehta; Pragmatic Guide) |
+| After P11 | Fowler event sourcing + versioned events | Turning the Database Inside Out (re-watch) |
+| After P12 | DDIA consistency chapters + cloud case studies | Kafka Summit curated talks |
 
 Happy breaking.

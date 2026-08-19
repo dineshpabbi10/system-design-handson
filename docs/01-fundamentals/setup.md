@@ -148,5 +148,11 @@ the `code/` folder has reference implementations.
         This is exactly why "no key" is a decision, not a default, for entity
         event streams (see [ordering](../02-concepts/ordering.md)).
 
+## Learn more
+
+- **Docs** — [Apache Kafka Quickstart](https://kafka.apache.org/quickstart) — the official single-broker walkthrough (what this page's compose approximates).
+- **Watch** — [Apache Kafka 101 (Confluent Developer)](https://developer.confluent.io/courses/apache-kafka/events/) — "Your First Kafka Application" module runs the same producer/consumer steps.
+- **Docs** — [Confluent Developer — Python client guide](https://developer.confluent.io/languages/python/) — `confluent_kafka` API for everything the projects build.
+
 Next: [Delivery Semantics](../02-concepts/delivery-semantics.md) — what the broker
 actually promises, and the choice between at-most-once and at-least-once.
