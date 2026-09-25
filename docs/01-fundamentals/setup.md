@@ -1,158 +1,300 @@
 # Local Environment Setup
 
-Everything in this guide runs locally on Docker. The stack grows as you progress:
+Every project uses the same stack and code shape. The project pages provide complete
+files for the pattern being taught; they do not depend on a hidden `code/` directory.
 
-| Project stages | Services |
-|----------------|----------|
-| P1 – P4 | Kafka (KRaft, 1 broker) + PostgreSQL |
-| P5 | + Debezium (CDC) |
-| P9 | + Schema Registry |
-| P12 | + Jaeger, OpenTelemetry collector |
+## Stack contract
 
-## Base Docker Compose
+| Concern | Choice |
+|---------|--------|
+| Python | 3.10+ |
+| HTTP | FastAPI with synchronous `def` handlers |
+| Kafka client | `confluent-kafka` |
+| PostgreSQL client | psycopg 3 DBAPI |
+| Database access | Raw SQL with `%s` parameters |
+| Rows and JSONB | `dict_row` and `psycopg.types.json.Jsonb` |
+| ORM | None: no SQLAlchemy or SQLModel |
+| Broker | Local single-node Kafka in KRaft mode |
+| Consumer offsets | Manual commits after the local processing step |
 
-```yaml title="docker-compose.yml" linenums="1"
+Synchronous FastAPI handlers avoid mixing blocking psycopg calls with `async def`.
+Workers are ordinary Python processes.
+
+## 1. Create the environment
+
+```bash
+mkdir kafka-postgres-lab
+cd kafka-postgres-lab
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install fastapi "uvicorn[standard]" confluent-kafka \
+  "psycopg[binary]" httpx pytest
+```
+
+The matching project dependency is:
+
+```text title="requirements.txt"
+fastapi
+uvicorn[standard]
+confluent-kafka
+psycopg[binary]
+httpx
+pytest
+```
+
+Export the same connection settings in every terminal used for a project:
+
+```bash
+export DATABASE_URL='postgresql://app:app@localhost:5432/app'
+export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
+```
+
+## 2. Create `compose.yaml`
+
+Host applications connect through `localhost:9092`. Docker-network services in P5,
+P9, and P12 connect through `kafka:29092`.
+
+```yaml title="compose.yaml"
+name: kafka-postgres-lab
+
 services:
   kafka:
-    image: apache/kafka:3.8.0
-    container_name: kafka
-    ports:
-      - "9092:9092"            # client access from your host
+    image: apache/kafka:3.8.1
     environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "127.0.0.1:9092:9092"
     volumes:
       - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+
   postgres:
     image: postgres:16
-    container_name: postgres
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
       POSTGRES_DB: app
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
   kafka-data:
+  postgres-data:
 ```
+
+Start and verify the stack:
 
 ```bash
-docker compose up -d
-docker compose ps          # both healthy
-docker compose logs -f kafka
+docker compose up -d --wait --wait-timeout 180
+docker compose ps
+docker compose exec postgres psql -U app -d app -c 'SHOW wal_level;'
 ```
 
-!!! note "Controlled chaos"
-    This is a **single broker** with replication factor 1 — fast and simple, *not*
-    durable. Production-grade behavior (ISR failover, `acks=all`) is still explained
-    conceptually and exercised in break-it experiments where possible with a
-    3-node `kraft-combined` setup (add brokers 2 and 3 porting the pattern above).
-    Multi-broker compose files are included in the code recipes for P2/P10.
+`SHOW wal_level` returns `logical`. The base stack is a deterministic local lab,
+not a highly available Kafka deployment: replication factor one has no failover
+replica.
 
-## Verify Kafka works
+## 3. Shared project files
+
+Create this small tree inside the current project. Later pages either show a
+replacement file in full or tell you to copy the shared file unchanged.
+
+```text
+project-name/
+  compose.yaml
+  requirements.txt
+  common.py
+  schema.sql
+  producer.py
+  consumer.py
+```
+
+The pages use these exact database and Kafka conventions:
+
+- `psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)`
+- `%s` placeholders; never `$1`, `:name`, or interpolated values
+- `Jsonb(value)` for `JSONB` parameters
+- `with connection.transaction():` around one database unit of work
+- `consumer.commit(message=message, asynchronous=False)` only after processing
+- `acks=all` and `enable.idempotence=true` for application producers
+- a delivery callback plus `flush()` before treating a produce as successful
+
+## 4. Shared `common.py`
+
+Copy this complete helper into each project that uses PostgreSQL or Kafka. Project
+files import these functions rather than inventing an async database wrapper.
+
+```python title="common.py"
+from datetime import datetime, timezone
+import json
+import os
+from typing import Any
+
+from confluent_kafka import Producer
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+
+def connect() -> psycopg.Connection:
+    return psycopg.connect(
+        os.environ["DATABASE_URL"],
+        row_factory=dict_row,
+    )
+
+
+def make_event(
+    event_id: str,
+    event_type: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+def new_producer(client_id: str) -> Producer:
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
+def jsonb(value: Any) -> Jsonb:
+    return Jsonb(value)
+```
+
+`make_event` requires the caller to supply a stable `event_id`. A random event ID
+inside a handler defeats deduplication when that handler is retried. Each project
+shows where its event ID comes from.
+
+## 5. Create and inspect a topic
+
+Topics are explicit because auto-creation makes partition counts and replication
+factors implicit.
 
 ```bash
-# inside the container, or use kcat (recommended, see below)
-docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 \
+  --create --if-not-exists \
+  --topic orders.events \
+  --partitions 3 \
+  --replication-factor 1 \
+  --config min.insync.replicas=1
 
-# interactive: type lines, see them arrive on the other side
-docker exec -it kafka /opt/kafka/bin/kafka-console-producer.sh \
-  --bootstrap-server localhost:9092 --topic quickstart
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic quickstart --from-beginning
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 \
+  --describe \
+  --topic orders.events
 ```
 
-### kcat (a.k.a. kafkacat) — your Swiss army knife
+A stable Kafka key is the event's `aggregate_id`. With a fixed topic partition
+count and partitioner, the same key maps to the same partition. Do not predict the
+partition number with Python's `hash()`.
+
+## 6. Apply and reset a schema
+
+Each project supplies its complete `schema.sql`. Apply it from the project root:
 
 ```bash
-brew install kcat
-kcat -b localhost:9092 -t orders -P -K: <<<'key1:{"order":1}'   # produce with key
-kcat -b localhost:9092 -t orders -C -K: -f 'key=%k value=%s\n'   # consume, show keys
-kcat -b localhost:9092 -L                                           # list topics & partitions
-kcat -b localhost:9092 -C -t orders -o -5 -e                         # last 5 records, exit
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
 ```
 
-## Python environment
-
-Each project uses the same pattern. Only `confluent-kafka` is non-obvious.
+For a disposable lab reset, stop the Python processes and run:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install fastapi "uvicorn[standard]" confluent-kafka sqlalchemy psycopg2-binary \
-    httpx pytest "tenacity" python-json-logger
+docker compose down -v
+docker compose up -d --wait --wait-timeout 180
 ```
 
-!!! tip
-    Any consumer in this course runs `enable.auto.offset.commit=false` and commits
-    **manually after processing** from day one. You will understand exactly why by
-    P3, and it will save you from silent message loss in every later project.
-
-## Project skeleton (shared from P1 onward)
-
-```
-code/
-  pXX-name/
-    docker-compose.yml        # services for that project
-    services/
-      <service>/app.py        # FastAPI entrypoint
-      <service>/kafka_cfg.py  # producer/consumer config helpers
-    scripts/
-      demo.sh                 # demonstrates the happy path
-      break_it.sh             # the "prove it" failure experiments
-    tests/                    # pytest, run against the live stack
-```
-
-Doing it yourself for P1 in your own repo first is the recommended hands-on path;
-the `code/` folder has reference implementations.
+Removing volumes also removes Kafka topics, consumer offsets, and PostgreSQL data.
 
 ## Checkpoint
 
-??? question "1. Start the stack. Create topic `test-orders` with 4 partitions via `kafka-topics.sh` — how do you know it worked?"
+??? question "Which database API do the project snippets use?"
     !!! success "Expected result"
-        `docker compose up -d` brings up `kafka` and `postgres` as healthy, and
-        after running
-        `docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
-        --create --topic test-orders --partitions 4 --replication-factor 1`
-        you see:
-        ```
-        Created topic test-orders.
-        ```
-        Verify with `kafka-topics.sh ... --describe --topic test-orders` → it lists
-        **4 partitions** (0–3), each with 1 replica. `kcat -L` shows the same.
+        They use `psycopg.connect`, raw SQL, `%s` parameters, `dict_row`, `Jsonb`,
+        and explicit transactions. They do not use SQLAlchemy, SQLModel, psycopg2,
+        asyncpg, or an undefined `db.fetchrow()` abstraction.
 
-??? question "2. Produce 10 messages with the same key and consume them — note the partition column."
+??? question "Why is the Kafka key the aggregate ID?"
     !!! success "Expected result"
-        All 10 land on **one partition** (say `partition=1`), with offsets
-        **0, 1, 2 … 9** in produce order. That's `hash(key) % 3` in action — same
-        key → same partition → strict order. (With the console producer, prefix
-        each line with `key:` the first time you use it in a session to send a key;
-        with `kcat` use `-K:`.)
-
-??? question "3. Produce 10 messages with *no* key. Which partitions do they land on? Why?"
-    !!! success "Expected result"
-        They spread across the 3 partitions (roughly round-robin) with **no
-        meaningful order between partitions**. With no key, librdkafka picks a
-        partition by round-robin/sticky balancing instead of hashing — so ordering
-        between any two of these messages is **not guaranteed** by the broker.
-        This is exactly why "no key" is a decision, not a default, for entity
-        event streams (see [ordering](../02-concepts/ordering.md)).
+        All events for one entity stay on one partition while its partition count
+        stays fixed. This gives per-entity order; it does not give global order.
 
 ## Learn more
 
-- **Docs** — [Apache Kafka Quickstart](https://kafka.apache.org/quickstart) — the official single-broker walkthrough (what this page's compose approximates).
-- **Watch** — [Apache Kafka 101 (Confluent Developer)](https://developer.confluent.io/courses/apache-kafka/events/) — "Your First Kafka Application" module runs the same producer/consumer steps.
-- **Docs** — [Confluent Developer — Python client guide](https://developer.confluent.io/languages/python/) — `confluent_kafka` API for everything the projects build.
+- **Docs** — [Psycopg 3 usage](https://www.psycopg.org/psycopg3/docs/basic/index.html)
+- **Docs** — [Confluent's Python client](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html)
 
-Next: [Delivery Semantics](../02-concepts/delivery-semantics.md) — what the broker
-actually promises, and the choice between at-most-once and at-least-once.
+Next: [Delivery Semantics](../02-concepts/delivery-semantics.md).

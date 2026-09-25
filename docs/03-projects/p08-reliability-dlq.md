@@ -1,228 +1,409 @@
 # P8 · Retries, Backoff & the Dead Letter Queue
 
-**Read first:** [Failure handling: retries & DLQ](../02-concepts/failure-handling.md) →
-[Idempotency](../02-concepts/idempotency.md)
+**Read first:** [Failure handling: retries & DLQ](../02-concepts/failure-handling.md)
 
-A saga pipeline is only as good as its failure ladder. Now: bounded backoff,
-poison messages that *leave* the hot path, a DLQ with forensics, and a replay
-tool you can trust. No more stuck partitions.
+This lab uses a durable PostgreSQL `retry_jobs` scheduler instead of Kafka time
+buckets. A future `run_at` stays in the database until due, so a restart cannot
+silently skip it. The source offset is committed only after a retry or DLQ
+handoff is acknowledged.
 
-## What you build
-
-```mermaid
-flowchart LR
-    M["orders topic"] -->|"process (transient fail)"| RT["orders.retry"]
-    RT -->|"after backoff (time-bucketed)"| M
-    M -->|"poison / attempts exceeded"| D["orders.dead<br/>(+ headers: error, attempts, ts)"]
-    D --> R["🚧 alert + replay tool<br/>(consumes DLQ → reproduce)<br/>idempotent consumers absorb"]
-```
-
-| Service you add | Behavior |
-|-----------------|----------|
-| `processing` consumer | tries `process()`; on failure → publish to retry topic with `attempt` header; commit main offset onward |
-| `retry` consumer | delayed delivery by **time-bucketed keys** (next section); re-emits to main topic |
-| replays | consume `*.dead` → (optionally filter) → reproduce to `orders` |
-
-## Steps
-
-### 1. Delivery count with headers (Kafka's honest "attempts" counter)
-
-No counter exists in the broker — the pattern is headers + your own budget:
-
-```python
-attempts = int(msg.headers().get("x-attempts", 0)) + 1
-```
-
-Define the ladder in `process(msg) -> Retry | Dead | Done`:
-
-| Case | Decision |
-|------|----------|
-| deserialize ok, business logic rejects permanently | → DLQ immediately (`x-error-type=invalid`) |
-| downstream 5xx / DB down | → retry (if `x-attempts < 5`) else DLQ |
-| unhandled exception | → retry with backoff; count; DLQ at 5 |
-
-```python
-def handle(msg):
-    evt = json.loads(msg.value())
-    attempts = int(dict(msg.headers()).get("x-attempts", 0)) + 1
-    try:
-        result = process(evt)                # business logic
-        if isinstance(result, PermanentReject):
-            dead_letter(msg, "permanent", attempts, str(result))
-        consumer.commit()                    # success → checkpoint
-    except TransientError as e:
-        if attempts >= MAX_ATTEMPTS:
-            dead_letter(msg, "exhausted", attempts, str(e))
-            consumer.commit()                # move PAST the dead record
-        else:
-            retry_produce(msg, attempts)     # publish to orders.retry
-            consumer.commit()                # and move past (retry owns it now)
-```
-
-Design note: after routing to retry/DLQ, **commit the main record** — otherwise the
-poison message re-locks the entire partition forever. The retry topic keeps the
-message alive; retrying inside `poll()` is the P2 storm trap.
-
-### 2. Time-bucketed delayed retries (no timers)
-
-Retry topic keyed by a **future time bucket**: `orders.retry` gets key
-`f"{future_minute:05d}:{order_id}"` (or partition-relative bucket when strict
-ordering matters). A `retry` consumer reads by partition scanning *active* buckets
-and forwards when `bucket <= now`:
-
-```python
-def run_retry_worker():
-    # consumes orders.retry with earliest, manual commit
-    while True:
-        msg = consumer.poll(1.0)
-        if not msg: continue
-        bucket = int(msg.key().split(":")[0])
-        if bucket <= now_minute():
-            produce_main(msg)               # re-emit to orders
-        else:
-            # park: re-seek to head of partition when the bucket arrives
-            pass
-        consumer.commit()
-```
-
-Backoff ladder: `attempt 1 → +1min, 2 → +5min, 3 → +10min, 4 → +30min, 5 → DLQ`.
-Verify with `kcat -t orders.retry -C` — records visibly "sleep" in the bucket.
-
-### 3. The DLQ capture
-
-```python
-def dead_letter(msg, error_type, attempts, detail):
-    producer.produce(
-        "orders.dead",
-        key=msg.key(),
-        value=msg.value(),
-        headers=[*msg.headers(),
-                 ("x-error-type", error_type),
-                 ("x-attempts", str(attempts)),
-                 ("x-error-detail", detail),
-                 ("x-source-partition-offset", f"{msg.partition()}/{msg.offset()}")],
-    )
-```
-
-Plus one alert query (kept from P4's style) — **DLQ non-empty for N minutes**,
-and an age query: any DLQ row older than X minutes = someone must look.
+## Exact topics and environment
 
 ```bash
-kcat -b localhost:9092 -t orders.dead -C -f 'key=%k p=%p o=%o %s\n' -e
+export DATABASE_URL='postgresql://app:app@localhost:5432/app'
+export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
+docker compose up -d --wait --wait-timeout 180
+for topic in orders.events orders.retry orders.dead; do
+  docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server kafka:29092 --create --if-not-exists \
+    --topic "$topic" --partitions 3 --replication-factor 1 \
+    --config min.insync.replicas=1
+done
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
 ```
 
-### 4. The replay tool (repair loop, not archaeology)
+`orders.events` is the source and replay target. `orders.retry` is an
+acknowledged wake-up and audit stream; the database row is the scheduler. The
+retry worker publishes due rows to `orders.events`. `orders.dead` holds
+forensics. The bounded budget is three retries after the first failure, then a
+DLQ handoff on the fourth failure.
 
-```python
-def replay(topic="orders.dead", filter_fn=None, limit=1000):
-    consumer = Consumer({"group.id": "dlq-replayer",
-                         "auto.offset.reset": "earliest", "enable.auto.offset.commit": False})
-    consumer.subscribe([topic])
-    while (n := 0) < limit:
-        msg = consumer.poll(1.0)
-        if msg is None: break
-        if filter_fn and not filter_fn(msg): continue
-        produce_main(msg)          # same event_id → consumer dedup absorbs stragglers
-        n += 1
-        consumer.commit()
+## Failure classes and headers
+
+Confluent headers are `(name, bytes)` pairs, not a string dictionary. This
+code preserves original headers, replaces only its own names, and decodes JSON
+explicitly from `message.value()`.
+
+| Failure | Action |
+|---|---|
+| invalid UTF-8, JSON, or envelope | DLQ immediately |
+| business rejection | DLQ immediately |
+| transient dependency failure | durable retry, then bounded DLQ |
+| unhandled exception | transient with the same budget |
+
+A source record is committed only after `publish_raw` receives its delivery
+callback and `flush()` returns. The job row is written first, so a crash before
+Kafka acknowledgment leaves repairable work and an uncommitted source offset.
+
+## Complete schema
+
+```sql title="schema.sql"
+CREATE TABLE IF NOT EXISTS processed_events (
+  consumer_group TEXT NOT NULL, event_id TEXT NOT NULL,
+  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (consumer_group, event_id)
+);
+CREATE TABLE IF NOT EXISTS order_effects (
+  event_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS retry_jobs (
+  job_id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, source_topic TEXT NOT NULL,
+  message_key TEXT, raw_value TEXT NOT NULL, headers JSONB NOT NULL,
+  attempt INTEGER NOT NULL CHECK (attempt > 0), run_at TIMESTAMPTZ NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'published')),
+  notified_at TIMESTAMPTZ, published_at TIMESTAMPTZ, last_error TEXT NOT NULL,
+  UNIQUE (event_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS retry_jobs_due_idx ON retry_jobs (run_at, job_id) WHERE state = 'pending';
+CREATE TABLE IF NOT EXISTS dead_letters (
+  dead_id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, source_topic TEXT NOT NULL,
+  source_partition INTEGER NOT NULL, source_offset BIGINT NOT NULL, message_key TEXT,
+  raw_value TEXT NOT NULL, payload JSONB, headers JSONB NOT NULL,
+  error_class TEXT NOT NULL, error_detail TEXT NOT NULL, attempts INTEGER NOT NULL CHECK (attempts > 0),
+  published_at TIMESTAMPTZ, replayed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (source_topic, source_partition, source_offset, error_class)
+);
 ```
 
-Replay to the main topic with **original event_id** — the consumer's
-`processed_events` (P3) makes replays a no-op for already-applied events, and
-applies the rest exactly once. This is the repair loop closing the at-least-once
-loop.
+`retry_jobs` is authoritative for scheduling. `dead_letters` is the durable
+index for the Kafka DLQ, so a crash between audit insert and DLQ publish is
+repairable without a consumer offset.
 
-## Break it
+## Complete reliability worker and CLI
 
-1. **Five 5xxs in a row** from a fake broken downstream → record lands in
-   `orders.dead` with `x-attempts=5`. Sit in the DLQ, alert fires.
-2. **Crash after retry_produce, before commit** → record appears twice (retry +
-   redelivery). Dedup proves only one apply. *This* is why retry topics + commit
-   discipline are the pair.
-3. **Poison message** (malformed JSON) injected via kcat → it should jump to DLQ
-   *immediately* (invalid type), never consume retry budget. Verify the ladder.
-4. **Replay storm:** replay the DLQ *while* the consumer group also still sees old
-   records — final state converges with no duplicates. Plant a duplicate race
-   (purge `processed_events` row mid-replay) and watch the constraint hold.
+```python title="reliability.py"
+import argparse
+import json
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import uuid4
+from confluent_kafka import Consumer, Producer
+import common
 
-## Checkpoints
+SOURCE_TOPIC = "orders.events"
+RETRY_TOPIC = "orders.retry"
+DEAD_TOPIC = "orders.dead"
+GROUP = "orders-reliability"
+MAX_ATTEMPTS = 4
+BACKOFF_SECONDS = (1, 5, 15)
 
-??? question "1. Why must we commit the record *before* routing to retry (two reasons: name both — after that: which gap does step-2-replay close)?"
-    Two reasons, both about **not blocking the partition**:
-    1. **The poison doesn't re-lock the partition**: if you don't commit past it,
-       the record is redelivered immediately, and your own consumer retries
-       *inline* (inside `poll()`) → the P2 storm trap, other healthy records
-       stuck behind it forever.
-    2. **Ownership is explicit**: the *retry topic* now owns the message — the
-       main consumer's job is "checkpoint the stream"; the retry worker's job is
-       "re-emit on schedule". Commit-past = "handed off", not "applied".
-    The gap step-2-replay closes: the **ack→retry-produce crash window**
-    (committed main offset, but the retry publish was lost). Replay = a
-    *repair loop*: re-consume the DLQ/retry topics and reproduce to main with
-    the same `event_id` — idempotent consumers (P3) make the already-applied
-    ones no-ops, and the missed ones finally apply. Commit-past + explicit
-    handoff + replay = the at-least-once repair loop, complete.
+class TransientFailure(RuntimeError):
+    pass
 
-??? question "2. Time-bucket: what breaks if two `orders.retry` consumers race the same bucket? (Design: partition key is the guard.)"
-    Two consumers racing a bucket can both read a record whose `bucket <= now`,
-    and **both re-emit it** → double delivery. The guard: the bucket key
-    **partitions the work** — `orders.retry` must be keyed
-    `f"{future_minute:05d}:{order_id}"` *including the order id*, so a given
-    retry record lands on exactly one partition and only its owner consumer
-    reads it (P2: one consumer per partition). With a key of just the bucket
-    (`"1001"`), every retry of that minute collides on one partition — you lose
-    parallelism and the race is back.
-    Second layer: even with per-record keys, **the consumer commits after
-    re-emitting** (manual commit); a crash between emit and commit → re-emit →
-    duplicates — absorbed by the consumer's `event_id` dedup (P3). Order of
-    defenses: key = partition guard, commit = delivery guard, dedup = last
-    resort.
+class PermanentFailure(RuntimeError):
+    pass
 
-??? question "3. Is DLQ replay idempotent for a *non-idempotent* consumer? What's your policy — replay to main topic, or to a `repair` topic consumed with fresh logic?"
-    **No — and never pretend otherwise.** Non-idempotent consumers apply every
-    delivery; replaying to main just double-applies (exactly what P3 exists to
-    prevent). Policy:
-    - **Idempotent consumers** (the whole ladder's assumption): replay to main
-      topic with original `event_id` — dedup absorbs stragglers; safe by design.
-    - **Non-idempotent consumers**: replay to a **`repair` topic** consumed by a
-      *fresh consumer with fixed logic* — either the fix makes the handler
-      idempotent, or the repair consumer runs a *merge* operation (e.g.
-      recompute-and-set state from the event) whose re-runs are harmless. The
-      repair topic also carries its own headers (`x-repair-reason`,
-      `x-original-offset`) for forensics.
-    Rule: **replay is safe exactly when apply is idempotent**. If you cannot
-    make apply idempotent, make replay *surgical* — never "point main topic at
-    the DLQ".
+def header_text(message: Any, name: str, default: str | None = None) -> str | None:
+    for key, value in message.headers() or []:
+        if key == name:
+            return (value or b"").decode("utf-8", errors="replace")
+    return default
 
-??? question "4. `x-attempts` headers: who writes, who reads, who resets? (Across retry cycles!)"
-    - **Writes**: the *retrying consumer* — each time it routes a record to
-      `orders.retry` it stamps `x-attempts = prev + 1` (P8 step 1 code) and
-      sets the `bucket` key accordingly.
-    - **Reads**: the *same retrying consumer* on redelivery (reads the header
-      to compute the next attempt), and the **DLQ sink** (reads `x-attempts` to
-      label the record "exhausted at N") — also the replay tool (reads it to
-      choose replay vs drop, P8's `filter_fn`).
-    - **Resets**: at the **DLQ→replay boundary**. Replaying a record to main
-      starts a *fresh cycle*: headers stripped, `x-attempts=0` re-stamped by the
-      next retry hop. Never let a replayed record re-enter with its old count —
-      you'd DLQ it after one bad re-delivery.
-    Ownership map: one writer (retry router), two readers (self + DLQ sink),
-    one reset point (replay). Any code that *doesn't* follow that map is the bug
-    you'll chase in runbooks.
+def headers_as_json(message: Any) -> list[list[str]]:
+    return [[key, (value or b"").decode("utf-8", errors="replace")] for key, value in message.headers() or []]
 
-## Done when
+def replace_headers(headers: list[list[str]], additions: dict[str, str]) -> list[tuple[str, bytes]]:
+    names = set(additions)
+    result = [(key, value.encode("utf-8")) for key, value in headers if key not in names]
+    result.extend((key, value.encode("utf-8")) for key, value in additions.items())
+    return result
 
-- [ ] Failed → retry with visible bucket sleeps → DLQ at budget, all via headers
-- [ ] Poison messages skip retries and hit DLQ instantly
-- [ ] A replay converges a corrupted pipeline with zero duplicates (SQL-prove)
-- [ ] You maintain a `runbook.md` per DLQ event type (3 rows minimum) — the art of
-      the repair loop
+def key_bytes(message: Any) -> bytes | None:
+    return message.key()
 
-## Learn more
+def key_text(message: Any) -> str | None:
+    key = message.key()
+    return key.decode("utf-8", errors="replace") if key is not None else None
 
-- **Docs** — [Confluent — Introduction to Kafka dead letter queues](https://www.confluent.io/learn/kafka-dead-letter-queue) — retry topic, DLQ and alerting design in one guide.
-- **Watch** — [Reliable Message Delivery with Apache Kafka (Kafka Summit SF 2018)](https://www.confluent.io/kafka-summit-sf18/reliable-message-delivery-with-apache-kafka/) — where duplicate/poison messages come from, end to end.
-- **Docs** — [Kafka — consumer configs](https://kafka.apache.org/documentation/#consumerconfigs_max.poll.interval.ms) — `max.poll.interval.ms`, `delivery.timeout.ms` and retries as the knobs your [failure-handling](../02-concepts/failure-handling.md) design reasoned about.
+def value_bytes(message: Any) -> bytes:
+    return message.value() or b""
 
-Next: **[P9 · Schema Registry & Evolution](p09-schema-registry.md)** — contracts,
-before they break you silently.
+def publish_raw(producer: Producer, topic: str, key: bytes | None, value: bytes, headers: list[tuple[str, bytes]]) -> None:
+    errors: list[str] = []
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+    producer.produce(topic, key=key, value=value, headers=headers, callback=delivered)
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+def decode_event(message: Any) -> dict[str, Any]:
+    try:
+        event = json.loads(value_bytes(message).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PermanentFailure(f"invalid-json: {error}") from error
+    if not isinstance(event, dict):
+        raise PermanentFailure("event must be a JSON object")
+    for field in ("event_id", "aggregate_id", "event_type"):
+        if not isinstance(event.get(field), str) or not event[field]:
+            raise PermanentFailure(f"{field} is required")
+    return event
+
+def process_event(event: dict[str, Any]) -> None:
+    with common.connect() as connection:
+        with connection.transaction():
+            claimed = connection.execute(
+                "INSERT INTO processed_events (consumer_group, event_id) VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) DO NOTHING RETURNING event_id",
+                (GROUP, event["event_id"]),
+            ).fetchone()
+            if claimed is None:
+                return
+            data = event.get("data")
+            if not isinstance(data, dict):
+                raise PermanentFailure("data must be an object")
+            mode = data.get("fail_mode")
+            if mode == "transient":
+                raise TransientFailure("injected transient failure")
+            if mode == "permanent":
+                raise PermanentFailure("injected permanent failure")
+            connection.execute(
+                "INSERT INTO order_effects (event_id, order_id, payload) VALUES (%s, %s, %s)",
+                (event["event_id"], event["aggregate_id"], common.jsonb(event)),
+            )
+
+def schedule_retry(message: Any, event: dict[str, Any], error: Exception, producer: Producer) -> None:
+    attempt = int(header_text(message, "x-attempts", "0") or 0) + 1
+    if attempt >= MAX_ATTEMPTS:
+        dead_letter(message, event, "exhausted", str(error), attempt, producer)
+        return
+    run_at = datetime.now(timezone.utc) + timedelta(seconds=BACKOFF_SECONDS[attempt - 1])
+    raw = value_bytes(message)
+    headers = headers_as_json(message)
+    with common.connect() as connection:
+        with connection.transaction():
+            job = connection.execute(
+                """
+                INSERT INTO retry_jobs (event_id, source_topic, message_key, raw_value, headers, attempt, run_at, state, last_error)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+                ON CONFLICT (event_id, attempt) DO UPDATE SET last_error = EXCLUDED.last_error
+                RETURNING job_id, notified_at
+                """,
+                (event["event_id"], SOURCE_TOPIC, key_text(message), raw.decode("utf-8", errors="replace"), common.jsonb(headers), attempt, run_at, str(error)),
+            ).fetchone()
+    if job["notified_at"] is not None:
+        return
+    wake_headers = replace_headers(headers, {"x-job-id": str(job["job_id"]), "x-attempts": str(attempt), "x-run-at": run_at.isoformat(), "x-error-class": "transient"})
+    publish_raw(producer, RETRY_TOPIC, key_bytes(message), raw, wake_headers)
+    with common.connect() as connection:
+        with connection.transaction():
+            connection.execute("UPDATE retry_jobs SET notified_at = now() WHERE job_id = %s", (job["job_id"],))
+
+def dead_letter(message: Any, event: dict[str, Any] | None, error_class: str, detail: str, attempts: int, producer: Producer) -> None:
+    raw = value_bytes(message)
+    partition = message.partition()
+    offset = message.offset()
+    event_id = event["event_id"] if event is not None else f"invalid-{message.topic()}-{partition}-{offset}"
+    headers = replace_headers(headers_as_json(message), {"x-error-type": error_class, "x-attempts": str(attempts), "x-error-detail": detail, "x-source-partition-offset": f"{partition}/{offset}"})
+    stored_headers = [[name, value.decode("utf-8", errors="replace")] for name, value in headers]
+    with common.connect() as connection:
+        with connection.transaction():
+            row = connection.execute(
+                """
+                INSERT INTO dead_letters (event_id, source_topic, source_partition, source_offset, message_key, raw_value, payload, headers, error_class, error_detail, attempts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_topic, source_partition, source_offset, error_class) DO UPDATE SET error_detail = EXCLUDED.error_detail
+                RETURNING dead_id, published_at
+                """,
+                (event_id, SOURCE_TOPIC, partition, offset, key_text(message), raw.decode("utf-8", errors="replace"), common.jsonb(event) if event is not None else None, common.jsonb(stored_headers), error_class, detail, attempts),
+            ).fetchone()
+    if row["published_at"] is not None:
+        return
+    publish_raw(producer, DEAD_TOPIC, key_bytes(message), raw, headers)
+    with common.connect() as connection:
+        with connection.transaction():
+            connection.execute("UPDATE dead_letters SET published_at = now() WHERE dead_id = %s", (row["dead_id"],))
+
+def retry_once(producer: Producer) -> bool:
+    with common.connect() as connection:
+        with connection.transaction():
+            job = connection.execute(
+                "SELECT job_id, event_id, message_key, raw_value, headers, attempt FROM retry_jobs WHERE state = 'pending' AND notified_at IS NOT NULL AND run_at <= now() ORDER BY run_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED"
+            ).fetchone()
+            if job is None:
+                return False
+            headers = replace_headers([[key, value] for key, value in job["headers"]], {"x-retry-of": job["event_id"], "x-job-id": str(job["job_id"]), "x-attempts": str(job["attempt"])})
+            publish_raw(producer, SOURCE_TOPIC, job["message_key"].encode("utf-8") if job["message_key"] is not None else None, job["raw_value"].encode("utf-8"), headers)
+            connection.execute("UPDATE retry_jobs SET state = 'published', published_at = now() WHERE job_id = %s", (job["job_id"],))
+            return True
+
+def retry_worker(once: bool) -> None:
+    producer = common.new_producer("p08-retry-worker")
+    while True:
+        try:
+            changed = retry_once(producer)
+        except Exception as error:
+            print(f"retry worker failed: {error}")
+            if once:
+                raise
+            time.sleep(1)
+        else:
+            if once:
+                return
+            time.sleep(0.5 if not changed else 0)
+
+def consume() -> None:
+    producer = common.new_producer("p08-router")
+    consumer = Consumer({"bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"], "group.id": GROUP, "auto.offset.reset": "earliest", "enable.auto.offset.commit": False})
+    consumer.subscribe([SOURCE_TOPIC])
+    try:
+        while True:
+            message = consumer.poll(1.0)
+            if message is None:
+                continue
+            if message.error() is not None:
+                raise RuntimeError(str(message.error()))
+            event: dict[str, Any] | None = None
+            try:
+                event = decode_event(message)
+                process_event(event)
+            except PermanentFailure as error:
+                dead_letter(message, event, "invalid" if event is None else "permanent", str(error), 1, producer)
+            except TransientFailure as error:
+                schedule_retry(message, event, error, producer)
+            except Exception as error:
+                schedule_retry(message, event, TransientFailure(str(error)), producer)
+            consumer.commit(message=message, asynchronous=False)
+    finally:
+        consumer.close()
+
+def produce(failure_mode: str, event_id: str) -> None:
+    producer = common.new_producer("p08-producer")
+    event = common.make_event(event_id, "OrderReceived", "order", event_id, {"order_id": event_id, "fail_mode": failure_mode})
+    if failure_mode == "malformed":
+        publish_raw(producer, SOURCE_TOPIC, event_id.encode("utf-8"), b'{"event_id":', [])
+    else:
+        common.publish(producer, SOURCE_TOPIC, event)
+    print(event_id)
+
+def replay(event_id: str | None, clear_failure: bool) -> None:
+    producer = common.new_producer("p08-replay")
+    with common.connect() as connection:
+        with connection.transaction():
+            rows = connection.execute(
+                "SELECT dead_id, event_id, message_key, raw_value, headers FROM dead_letters WHERE published_at IS NOT NULL AND replayed_at IS NULL AND (%s::text IS NULL OR event_id = %s) ORDER BY dead_id LIMIT 100 FOR UPDATE SKIP LOCKED",
+                (event_id, event_id),
+            ).fetchall()
+            for row in rows:
+                value = row["raw_value"].encode("utf-8")
+                if clear_failure:
+                    event = json.loads(value)
+                    event["data"]["fail_mode"] = "none"
+                    value = json.dumps(event, separators=(",", ":")).encode("utf-8")
+                headers = replace_headers([[key, header] for key, header in row["headers"]], {"x-replay": "true", "x-original-event-id": row["event_id"]})
+                publish_raw(producer, SOURCE_TOPIC, row["message_key"].encode("utf-8") if row["message_key"] is not None else None, value, headers)
+                connection.execute("UPDATE dead_letters SET replayed_at = now() WHERE dead_id = %s", (row["dead_id"],))
+    print(f"replayed {len(rows)} record(s)")
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=["produce", "consume", "retry", "replay"])
+    parser.add_argument("--event-id")
+    parser.add_argument("--failure-mode", default="none")
+    parser.add_argument("--clear-failure", action="store_true")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    event_id = args.event_id or str(uuid4())
+    if args.command == "produce":
+        produce(args.failure_mode, event_id)
+    elif args.command == "consume":
+        consume()
+    elif args.command == "retry":
+        retry_worker(args.once)
+    else:
+        replay(args.event_id, args.clear_failure)
+
+if __name__ == "__main__":
+    main()
+```
+
+The retry worker is a PostgreSQL scheduler, not a future-bucket consumer. It
+publishes only due rows; a future row is never committed away from Kafka. The
+`orders.retry` record is a durable notification, while PostgreSQL remains the
+source of due-time state.
+
+## Failure injection and SQL assertions
+
+Start the consumer and retry worker in separate terminals:
+
+```bash
+python reliability.py consume
+python reliability.py retry
+```
+
+A valid event demonstrates the idempotent effect:
+
+```bash
+python reliability.py produce --event-id e-ok --failure-mode none
+sleep 1
+docker compose exec -T postgres psql -U app -d app -c \
+  "SELECT event_id, count(*) FROM order_effects WHERE event_id = 'e-ok' GROUP BY event_id;"
+```
+
+A transient failure creates bounded durable jobs. The injected mode remains
+active so the retries demonstrate exhaustion:
+
+```bash
+python reliability.py produce --event-id e-transient --failure-mode transient
+sleep 25
+docker compose exec -T postgres psql -U app -d app -c \
+  "SELECT event_id, attempt, state, run_at, notified_at, published_at, last_error
+   FROM retry_jobs WHERE event_id = 'e-transient' ORDER BY attempt;"
+docker compose exec -T postgres psql -U app -d app -c \
+  "SELECT event_id, error_class, attempts, published_at
+   FROM dead_letters WHERE event_id = 'e-transient';"
+```
+
+The first query has attempts 1, 2, and 3, all `published`; the second has one
+`exhausted` row with `attempts = 4` and a non-null `published_at`. Malformed
+input skips the retry budget:
+
+```bash
+python reliability.py produce --event-id e-malformed --failure-mode malformed
+sleep 1
+docker compose exec -T postgres psql -U app -d app -c \
+  "SELECT event_id, error_class, attempts, error_detail
+   FROM dead_letters WHERE event_id LIKE 'invalid-%' ORDER BY dead_id DESC LIMIT 1;"
+```
+
+Replay is database-backed. It republishes the original value and marks
+`replayed_at` only after Kafka acknowledgment. `--clear-failure` is a lab-only
+repair of the injected mode:
+
+```bash
+python reliability.py produce --event-id e-permanent --failure-mode permanent
+sleep 1
+python reliability.py replay --event-id e-permanent --clear-failure
+sleep 1
+docker compose exec -T postgres psql -U app -d app -c \
+  "SELECT event_id, error_class, replayed_at FROM dead_letters WHERE event_id = 'e-permanent';"
+docker compose exec -T postgres psql -U app -d app -c \
+  "SELECT event_id, count(*) FROM order_effects WHERE event_id = 'e-permanent' GROUP BY event_id;"
+```
+
+## Remaining dual-write gap
+
+The job insert and Kafka wake-up remain two systems, not one distributed
+transaction. PostgreSQL is durable before Kafka, the source offset waits for
+acknowledgment, and a crash in the gap is repaired by the scheduler or Kafka
+redelivery. A crash after acknowledgment but before marking the row can
+publish a duplicate; `processed_events` and the effect key absorb it. There is
+no exactly-once transaction across PostgreSQL and Kafka.
+
+Next: **[P9 · Schema Registry & Evolution](p09-schema-registry.md)**.

@@ -4,191 +4,206 @@
 [Kafka architecture](../01-fundamentals/kafka-architecture.md) →
 [Setup](../01-fundamentals/setup.md)
 
-Your first night with Kafka: a single topic, a producer that makes orders, and a
-consumer that reads them — with your own eyes on **partitions and offsets**.
+A single topic, a keyed producer, and a consumer you can watch move records
+between partitions and offsets.
 
 ## What you build
 
 ```mermaid
 flowchart LR
-    A["FastAPI producer<br/>POST /orders → produce"] -->|"key=order_id"| K["topic: orders — 3 partitions"]
-    K --> C["consumer (console or python)"]
+    P["producer.py"] -->|"key=order_id"| K["orders: 3 partitions"]
+    K --> C["consumer.py"]
 ```
 
-| Skill | Learned by |
-|-------|-----------|
-| Start Kafka via Docker (KRaft) | setup page, docker compose |
-| Create topics, inspect partitions/offsets | `kafka-topics.sh`, `kcat -L` |
-| Produce with keys | key → partition relationship |
-| Consume in a group, see assignment | console consumer, later groups |
-| Read lag | `kafka-consumer-groups.sh --describe` |
+## Shared files and setup
 
-## Steps
+Copy the shared `compose.yaml` and `common.py` unchanged from
+[Setup](../01-fundamentals/setup.md). The project files are:
 
-### 1. Stack up
+```text
+compose.yaml
+requirements.txt
+common.py
+producer.py
+consumer.py
+```
+
+Start the shared stack and create the topic explicitly:
 
 ```bash
-docker compose up -d          # from the base compose in setup
+docker compose up -d --wait --wait-timeout 180
 docker compose ps
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 \
+  --create --if-not-exists \
+  --topic orders --partitions 3 --replication-factor 1 \
+  --config min.insync.replicas=1
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --describe --topic orders
 ```
 
-### 2. Topics
+The producer uses the shared envelope, stable event ID, keyed delivery callback,
+and `flush()` in `common.publish`. Start it from this project root:
 
 ```bash
-docker exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --create \
-  --topic orders --partitions 3 --replication-factor 1
+python producer.py
 ```
 
-### 3. Python producer (the skeleton every later project copies)
+## 1. `producer.py`
 
-```python title="produce_orders.py"
-from confluent_kafka import Producer
+```python title="producer.py"
+import common
 
-producer = Producer({"bootstrap.servers": "localhost:9092",
-                     "acks": "all",                        # see concept: durability
-                     "enable.idempotence": True,           # see P10
-                     "client.id": "order-producer"})
+TOPIC = "orders"
 
-ORDER_COUNTER = 0
 
-def delivery_cb(err, msg):                    # NEVER skip error callbacks
-    if err:
-        print(f"DELIVERY FAILED: {err}")
-    else:
-        print(f"→ {msg.topic()}[{msg.partition()}] @ {msg.offset()}")
+def main() -> None:
+    producer = common.new_producer("p01-order-producer")
+    for number in range(20):
+        order_id = f"ord-{number:03d}"
+        event = common.make_event(
+            event_id=f"order-{order_id}-placed",
+            event_type="OrderPlaced",
+            aggregate_type="order",
+            aggregate_id=order_id,
+            data={"order_id": order_id, "amount": 100 + number},
+        )
+        common.publish(producer, TOPIC, event)
 
-def place_order(order_id: str, amount: int):
-    payload = f'{{"order_id": "{order_id}", "amount": {amount}}}'
-    producer.produce("orders",
-                     key=order_id,            # ← the ordering decision
-                     value=payload,
-                     callback=delivery_cb)
-    producer.flush()                          # wait for ack (demo only)
 
-for i in range(20):
-    place_order(f"ord-{i:03d}", 100 + i)
+if __name__ == "__main__":
+    main()
 ```
 
-Run it, watch `delivery_cb` print `partition` and `offset` — that's the ack path.
-Then produce 20 messages with `key=None` and see partitions scatter.
+Each `produce` waits for its delivery callback to report success. The callback
+receives the broker-assigned partition and offset; a timeout or delivery error
+raises instead of being silently ignored.
 
-### 4. Consume with your eyes
+## 2. `consumer.py`
 
-```bash
-# console consumer, show key + partition
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic orders --from-beginning \
-  --property print.key=true --property print.partition=true
+Start it with `python consumer.py` in another terminal. Run this:
 
-# same, via kcat
-kcat -b localhost:9092 -t orders -C -K: -f 'partition=%p offset=%o key=%k value=%s\n'
-```
-
-### 5. Consumer group + lag
-
-```python title="consume_orders.py"
+```python title="consumer.py"
 from confluent_kafka import Consumer
 
-consumer = Consumer({
-    "bootstrap.servers": "localhost:9092",
-    "group.id": "orders-console-group",
-    "auto.offset.reset": "earliest",
-    "enable.auto.offset.commit": False,   # discipline from day 1
-})
-consumer.subscribe(["orders"])
+TOPIC = "orders"
+GROUP = "orders-console-group"
 
-while True:
-    msg = consumer.poll(1.0)
-    if msg is None:      continue
-    if msg.error():      raise Exception(msg.error())
-    print(f"group read: {msg.key()} {msg.value()} [p{msg.partition()} o{msg.offset()}]")
-    consumer.commit(asynchronous=False)
+
+def main() -> None:
+    consumer = Consumer(
+        {
+            "bootstrap.servers": "localhost:9092",
+            "group.id": GROUP,
+            "auto.offset.reset": "earliest",
+            "enable.auto.offset.commit": False,
+        }
+    )
+    consumer.subscribe([TOPIC])
+    try:
+        while True:
+            message = consumer.poll(1.0)
+            if message is None:
+                continue
+            error = message.error()
+            if error is not None:
+                raise RuntimeError(str(error))
+            key = (message.key() or b"").decode("utf-8")
+            value = (message.value() or b"").decode("utf-8")
+            print(
+                f"p{message.partition()} o{message.offset()} "
+                f"key={key} value={value}"
+            )
+            consumer.commit(message=message, asynchronous=False)
+    finally:
+        consumer.close()
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-While it runs, check lag from another terminal:
+The consumer commits only after its local processing step, which here is the
+print. A crash between the side effect and the commit can replay a record.
+
+## 3. Consume without the Python loop
+
+Use this when you want to see keys and partitions directly:
 
 ```bash
-docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server localhost:9092 --describe --group orders-console-group
+docker compose exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:29092 \
+  --topic orders --from-beginning \
+  --property print.key=true \
+  --property print.partition=true \
+  --property print.offset=true
 ```
 
-Kill the consumer, produce 10 more, restart → it resumes at the committed offset
-(never replays, never skips).
+While the Python consumer is stopped or running, inspect the group and its lag:
 
-## Break it (the real lesson)
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:29092 \
+  --describe --group orders-console-group
+```
 
-1. **Kill the consumer mid-read**, produce 20 orders, restart. Note exactly which
-   offsets it starts from. Did you lose/duplicate any? (Answer: late-committed
-   records between process and commit may re-read → duplicates possible — write
-   this observation down.)
-2. **Restart the broker** (`docker compose restart kafka`). Produce + consume again.
-   What survives? What didn't (hint: `acks` config, retention)?
-3. **Set `acks=0`** and cut the network (or just stop broker). Silent loss or error?
-   This is why `acks=all` is the default in this guide.
-4. Produce 2 orders with the **same key** and 2 with different keys. Watch their
-   partitions and offsets. Re-state the "same key → same partition → ordered" law
-   in your own words.
+The command shows the current assignment, committed offset, log end offset, and
+lag for each assigned partition. Produce more records, then run the command again
+to watch lag rise or fall.
 
-## Checkpoints (write these down)
+## Ordering lesson
 
-??? question "1. What exactly does `offset` mean in the delivery callback vs in the consumer?"
-    - **Delivery callback**: the *broker-assigned* position of the record **within
-      its partition** after acknowledgment (`msg.partition()`, `msg.offset()`).
-      The producer learns this only after the ack — the offset is stamped by the
-      broker, not by you.
-    - **Consumer**: `msg.offset()` is the position in the partition *from which
-      the consumer read this record*; the **committed offset** is your group's
-      stored position in the broker's `__consumer_offsets` topic — where the
-      group will resume after restart/rebalance.
-    Same number, two lifetimes: producer-side = "broker accepted it here",
-    consumer-side = "we've processed up to here" — only the second is a
-    checkpoint.
+With a fixed topic partition count and partitioner, the same non-null key maps
+deterministically to the same partition. Records appended to one partition keep
+their partition order, so events for one order are ordered relative to one
+another. This is **per-key ordering**, not a total order across the topic: records
+with different keys can be interleaved across partitions. Changing partition
+count or partitioner can remap a key, and a null key does not provide entity
+ordering.
 
-??? question "2. Why did the same-key records go to one partition and null-key records scatter?"
-    Kafka computes partition = `hash(key) % num_partitions` when a key exists —
-    deterministically, so the **same key always lands on the same partition**,
-    which is what makes per-key ordering possible. With `key=None` the client
-    round-robins (or uses sticky partitioning) across all partitions — records
-    scatter, so two events of the *same logical entity* can end up on different
-    partitions and their relative order is **not preserved** (reading them back is
-    a wheel of fortune). That's the P2 ordering law in one paragraph.
+The offset in a delivery callback is the broker position assigned to the record
+after acknowledgment. The consumer's offset identifies the record it read; the
+group's committed offset is the restart checkpoint and advances only after the
+local processing step.
 
-??? question "3. `min.insync.replicas` with a single broker: what's possible/not possible here?"
-    With **one broker** you can only have `RF=1` and `min.insync.replicas=1` —
-    possible only as a *demo*: `acks=all` then means "the single broker acked".
-    What's **not possible**: any real ISR-based durability. A single broker is a
-    single point of failure — lose it and you lose every topic, every offset, every
-    ISR story: there are no other replicas to catch up, no ISR shrinking
-    protection (a broker can't stand as its own quorum partner), and "durable" is
-    a euphemism.
-    The production lesson (P1 → P12): RF ≥ 3, `min.insync.replicas=2`, per-broker
-    failure then doesn't burn data — the config you *never* ship to prod is
-    exactly this compose's `RF=1`.
+## Break it
 
-??? question "4. Which two configs make your producer reliably durable end-to-end on the broker?"
-    - **`acks=all`** — wait for *all* ISR replicas to acknowledge before the
-      produce is done → no "leader acked, then lost the data" window.
-    - **`enable.idempotence=true`** — sequence numbers make broker-side
-      duplicate *impossible* even when retries happen after ambiguous failures
-      (the P10 groundwork).
-    Together: each produce is *durable* (all replicas) and *duplicate-free*
-    (idempotent sequence) — "exactly-once per produce" at the broker.
-    (Optional third: `min.insync.replicas=2` at the broker — it converts
-    `acks=all` from theory to promise by refusing to lead without a quorum.)
+1. Stop the consumer after it reads a record but before it commits, produce more
+   records, and restart it. Which records replay, and why can a late commit cause
+   duplicates?
+2. Run `docker compose restart kafka`, then produce and consume again. Which data
+   survives in this single-broker lab?
+3. Change a copy of the producer to use a null key. Compare partitions and explain
+   why two events for one logical entity can now be observed out of order.
+4. Create two records with the same key and two with different keys. Record each
+   partition and offset, then restate the ordering guarantee without saying that
+   Kafka orders the whole topic.
+
+## Checkpoints
+
+??? question "What does the delivery callback prove?"
+    A broker acknowledged the record and assigned its partition and offset. It
+    does not prove that a consumer committed its local processing.
+
+??? question "What does a group commit do?"
+    It stores the next position from which the group can resume. Manual commit
+    after processing provides at-least-once behavior: a crash before commit can
+    replay, but a successful commit is not an early side-effect checkpoint.
+
+??? question "Does a key provide global ordering?"
+    No. It provides deterministic routing and per-partition order for that key
+    while the topic mapping is stable. Different partitions have independent logs.
+
+??? question "What is lag?"
+    For each assigned partition it is the difference between the log end offset and
+    the group's committed position. More consumers help only when idle partitions
+    exist and their processing is faster than the producer.
 
 ## Done when
 
-- [ ] You can describe what a partition is to someone else without slides
-- [ ] You have produced with and without keys and observed the difference
-- [ ] You have measured, then explained, consumer lag
-- [ ] You killed something and observed exactly one of the failure modes above
+- [ ] You produced keyed records and observed partitions and offsets.
+- [ ] You inspected a group assignment and measured lag.
+- [ ] You can explain the difference between acknowledgment and commit.
+- [ ] You can state the per-key ordering rule and its limits.
 
-## Learn more
-
-- **Docs** — [Confluent Developer — Python client guide](https://developer.confluent.io/languages/python/) — `Producer`/`Consumer`/`AdminClient` API this project wires up by hand.
-- **Watch** — [Apache Kafka 101 — "Your First Kafka Application" module](https://developer.confluent.io/courses/apache-kafka/events/) — the same hello-world, video form.
-- **Read** — [The Log: What every software engineer should know](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction) (Jay Kreps) — why the trivially-simple API is a big deal.
-
-Next: **[P2 · Consumer groups & scaling](p02-consumer-groups.md)** — parallelism,
-rebalance, and why "5 consumers for 4 partitions" is a trap.
+Next: **[P2 · Consumer groups & scaling](p02-consumer-groups.md)**.

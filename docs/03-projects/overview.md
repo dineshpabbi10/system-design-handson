@@ -14,6 +14,9 @@ counts.
    interview questions later.
 5. Keep every service **boringly small** (one file, one concern). The patterns are
    the point, not the code.
+6. Copy the shared `common.py` from [Local Environment Setup](../01-fundamentals/setup.md).
+   A snippet is complete only when its imports, connection handling, event producer,
+   and startup command are shown.
 
 ## The ladder at a glance
 

@@ -2,199 +2,446 @@
 
 **Read first:** [The Transactional Outbox Pattern](../02-concepts/outbox.md)
 
-The heart of the course. One database, one transaction, zero lost events. You build
-the polling relay yourself — and then you break it.
+Store the business row and its event in one PostgreSQL transaction. A polling
+relay publishes the stored event and marks it only after Kafka acknowledges it.
 
 ## What you build
 
 ```mermaid
 flowchart LR
-    C["POST /orders"] --> API["order service (FastAPI)"]
-    API -->|"1 txn: INSERT orders + INSERT outbox"| DB[("postgres: orders,<br/>orders_outbox")]
-    DB -->|"2 polls unpublished"| R["relay (polling publisher)"]
-    R -->|"3 produce (acks=all)"| K["kafka: orders"]
-    K --> W["consumer: inventory service<br/>(idempotent, P3 pattern)"]
-    W --> IDB[("inventory db")]
+    C["POST /orders"] --> A["api.py"]
+    A -->|"one transaction: order and outbox"| D[("orders and orders_outbox")]
+    D --> R["relay.py"]
+    R -->|"keyed event"| K["orders.events topic"]
+    K --> W["inventory_worker.py"]
+    W --> I[("inventory and adjustments")]
 ```
 
-| Skill | Learned by |
-|-------|-----------|
-| Dual-write avoidance | compare: old "insert then publish" in break-it |
-| Outbox schema + partial index | SQL + query plans |
-| Relay: poll → publish → mark order | the exact crash windows |
-| Ordering via `ORDER BY id` | multi-event sequences |
-| Idempotent ingestion | P3 dedup table reused |
-| Alerts on stuck outbox | `published=FALSE` age query |
+## Shared files and setup
 
-## Steps
+Copy the shared `compose.yaml` and `common.py` unchanged from
+[Setup](../01-fundamentals/setup.md). Add these exact files:
 
-### 1. Tables
-
-```sql
-CREATE TABLE orders (
-  order_id    TEXT PRIMARY KEY,
-  customer_id TEXT NOT NULL,
-  amount      NUMERIC(12,2) NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'new',
-  created_at  TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE orders_outbox (
-  id           BIGSERIAL PRIMARY KEY,
-  aggregate_id TEXT NOT NULL,             -- order_id → partition key
-  event_type   TEXT NOT NULL,
-  payload      JSONB NOT NULL,
-  published    BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at   TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX idx_outbox_unpublished
-  ON orders_outbox (published, id) WHERE published = FALSE;
+```text
+compose.yaml
+common.py
+requirements.txt
+schema.sql
+api.py
+relay.py
+inventory_worker.py
 ```
 
-### 2. The atomic write
+Start the shared stack, create the topic, and apply the schema:
 
-```python
+```bash
+docker compose up -d --wait --wait-timeout 180
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 \
+  --create --if-not-exists \
+  --topic orders.events --partitions 3 --replication-factor 1 \
+  --config min.insync.replicas=1
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
+```
+
+The inventory seed is part of `schema.sql`, so the curl example has stock
+available.
+
+## 1. `schema.sql`
+
+```sql title="schema.sql"
+CREATE TABLE IF NOT EXISTS orders (
+  order_id          TEXT PRIMARY KEY,
+  customer_id       TEXT NOT NULL,
+  sku               TEXT NOT NULL,
+  quantity          INTEGER NOT NULL CHECK (quantity > 0),
+  amount            NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  status            TEXT NOT NULL DEFAULT 'new',
+  aggregate_version BIGINT NOT NULL CHECK (aggregate_version > 0),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS orders_outbox (
+  id                BIGSERIAL PRIMARY KEY,
+  aggregate_id      TEXT NOT NULL,
+  aggregate_version BIGINT NOT NULL CHECK (aggregate_version > 0),
+  event_type        TEXT NOT NULL,
+  event_id          TEXT NOT NULL UNIQUE,
+  payload           JSONB NOT NULL,
+  published         BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (aggregate_id, aggregate_version)
+);
+
+CREATE INDEX IF NOT EXISTS orders_outbox_pending_idx
+  ON orders_outbox (published, aggregate_id, aggregate_version)
+  WHERE published = FALSE;
+
+CREATE TABLE IF NOT EXISTS inventory (
+  sku        TEXT PRIMARY KEY,
+  available  INTEGER NOT NULL CHECK (available >= 0),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS processed_events (
+  consumer_group TEXT NOT NULL,
+  event_id       TEXT NOT NULL,
+  claimed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer_group, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_adjustments (
+  adjustment_id  BIGSERIAL PRIMARY KEY,
+  consumer_group TEXT NOT NULL,
+  event_id       TEXT NOT NULL,
+  sku            TEXT NOT NULL REFERENCES inventory(sku),
+  quantity_delta INTEGER NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (consumer_group, event_id)
+);
+
+INSERT INTO inventory (sku, available)
+VALUES ('sku-1', 100)
+ON CONFLICT (sku) DO NOTHING;
+```
+
+`aggregate_version` is the order's business sequence. The shown create path
+writes version 1; a later order transition must lock that order, increment the
+version, and insert its outbox row in the same transaction.
+
+## 2. `api.py`: one transaction
+
+The event envelope is built before the transaction and inserted as JSONB beside
+the order. Nothing in this request publishes directly to Kafka.
+
+```python title="api.py"
+from decimal import Decimal
+from uuid import uuid4
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+import common
+
+app = FastAPI()
+
+
+class CreateOrderRequest(BaseModel):
+    customer_id: str
+    sku: str
+    quantity: int = Field(gt=0)
+    amount: Decimal = Field(gt=0)
+
+
 @app.post("/orders")
-async def create_order(req: CreateOrderReq):
+def create_order(request: CreateOrderRequest) -> dict[str, str | int]:
     order_id = str(uuid4())
-    async with db.transaction():
-        await db.execute(
-            "INSERT INTO orders (order_id, customer_id, amount) VALUES ($1,$2,$3)",
-            order_id, req.customer_id, req.amount)
-        await db.execute(
-            "INSERT INTO orders_outbox (aggregate_id, event_type, payload) "
-            "VALUES ($1, 'OrderPlaced', $2)",
-            order_id, json.dumps({"order_id": order_id,
-                                  "customer_id": req.customer_id,
-                                  "amount": req.amount,
-                                  "event_id": f"order-{order_id}-placed"}))
-    return {"order_id": order_id}
+    aggregate_version = 1
+    event = common.make_event(
+        event_id=f"order-{order_id}-placed",
+        event_type="OrderPlaced",
+        aggregate_type="order",
+        aggregate_id=order_id,
+        data={
+            "order_id": order_id,
+            "customer_id": request.customer_id,
+            "sku": request.sku,
+            "quantity": request.quantity,
+            "amount": str(request.amount),
+            "aggregate_version": aggregate_version,
+        },
+    )
+    with common.connect() as connection:
+        with connection.transaction():
+            connection.execute(
+                """
+                INSERT INTO orders
+                    (order_id, customer_id, sku, quantity, amount, aggregate_version)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    order_id,
+                    request.customer_id,
+                    request.sku,
+                    request.quantity,
+                    request.amount,
+                    aggregate_version,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO orders_outbox
+                    (aggregate_id, aggregate_version, event_type, event_id, payload)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    order_id,
+                    aggregate_version,
+                    event["event_type"],
+                    event["event_id"],
+                    common.jsonb(event),
+                ),
+            )
+    return {"order_id": order_id, "aggregate_version": aggregate_version}
 ```
 
-### 3. The relay (this bit is the whole project)
+If the process dies before commit, neither row exists. If it dies after commit,
+the pending outbox row remains available to the relay. That is the improvement
+over P3's separate database commit and Kafka publish.
 
-```python
-def relay_loop():
-    producer = Producer({"bootstrap.servers": "localhost:9092",
-                         "acks": "all", "enable.idempotence": True})
-    while True:
-        rows = db.fetchall("""
-            SELECT id, aggregate_id, event_type, payload
-              FROM orders_outbox WHERE published = FALSE
-             ORDER BY id LIMIT 100""")
+## 3. `relay.py`: lock, publish, acknowledge, mark
+
+Start the API and relay in separate terminals:
+
+```bash
+python -m uvicorn api:app --host 127.0.0.1 --port 8000
+python relay.py
+```
+
+The relay uses the shared producer settings, but keeps the delivery callback and
+`flush()` visible because the mark must follow an acknowledged produce.
+
+```python title="relay.py"
+import json
+import time
+from typing import Any
+
+import common
+
+TOPIC = "orders.events"
+
+
+def publish_row(producer: Any, row: dict[str, Any]) -> None:
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        TOPIC,
+        key=str(row["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(
+            row["payload"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
+def relay_once(connection: Any, producer: Any) -> int:
+    with connection.transaction():
+        rows = connection.execute(
+            """
+            SELECT id, aggregate_id, aggregate_version, payload
+            FROM orders_outbox
+            WHERE published = FALSE
+            ORDER BY aggregate_id, aggregate_version, id
+            LIMIT 100
+            FOR UPDATE SKIP LOCKED
+            """
+        ).fetchall()
         for row in rows:
-            producer.produce("orders", key=row.aggregate_id,
-                             value=json.dumps(row.payload))
-        producer.flush()                          # ← broker acked BEFORE marking
-        for row in rows:
-            db.execute("UPDATE orders_outbox SET published = TRUE WHERE id = :id",
-                       {"id": row.id})
-        time.sleep(0.1)
+            publish_row(producer, row)
+        if rows:
+            connection.execute(
+                "UPDATE orders_outbox SET published = TRUE WHERE id = ANY(%s)",
+                ([row["id"] for row in rows],),
+            )
+    return len(rows)
+
+
+def main() -> None:
+    producer = common.new_producer("p04-outbox-relay")
+    with common.connect() as connection:
+        while True:
+            try:
+                count = relay_once(connection, producer)
+            except Exception as error:
+                print(f"relay failed: {error}")
+                time.sleep(1)
+            else:
+                if count == 0:
+                    time.sleep(0.1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-**The contract:** mark-after-ack. `flush()` throwing? → no mark, rows retry later.
-Crash between ack and mark → row re-published → duplicate *delivery*, which P3
-dedup made harmless. Never reorder: `ORDER BY id` is what preserves commit order.
+`FOR UPDATE SKIP LOCKED` lets another relay instance claim different pending
+rows instead of publishing the same selected row. A crash after Kafka
+acknowledgment and before the database commit leaves the row pending, so the
+event is delivered again. The consumer-side claim makes that duplicate harmless.
+A delivery error or timeout raises before the update and leaves every selected
+row pending.
 
-### 4. Idempotent consumer (reuse P3 muscle memory)
+`ORDER BY aggregate_id, aggregate_version` is the per-order ordering rule. A
+`BIGSERIAL` value is allocated from a sequence when a row is inserted; it is not
+proof of transaction commit order, because a transaction can receive a value
+before another transaction commits. `created_at` is also a clock value, not a
+commit sequence. Use the order row's locked, incremented `aggregate_version` for
+order history. With multiple relay replicas, keep one owner for a given order if
+strict contiguous versions are required; row locks alone do not stop a replica
+from taking a later version while an earlier version is locked.
 
-Inventory consumer: `INSERT INTO processed_events ... ON CONFLICT DO NOTHING`
-then `UPDATE sku SET qty = qty - amount ...` in the same txn. Ship it, wire it,
-verify stock drops exactly once.
+## 4. `inventory_worker.py`
 
-### 5. Observable outbox
+Start the worker in another terminal:
 
-A tiny endpoint + alert query (`docker exec` cron is fine):
-
-```sql
-SELECT count(*) FROM orders_outbox WHERE published = FALSE AND created_at < now() - interval '1 minute';
+```bash
+python inventory_worker.py
 ```
 
-Stale unpublished rows = relay dead. This query is your "pipeline is alive" probe.
+The worker claims the event, decrements stock, and writes a real adjustment row
+in one database transaction. The Kafka commit follows that transaction.
+
+```python title="inventory_worker.py"
+import json
+
+from confluent_kafka import Consumer
+
+import common
+
+TOPIC = "orders.events"
+GROUP = "inventory-workers"
+
+
+def main() -> None:
+    consumer = Consumer(
+        {
+            "bootstrap.servers": "localhost:9092",
+            "group.id": GROUP,
+            "auto.offset.reset": "earliest",
+            "enable.auto.offset.commit": False,
+        }
+    )
+    consumer.subscribe([TOPIC])
+    try:
+        while True:
+            message = consumer.poll(1.0)
+            if message is None:
+                continue
+            error = message.error()
+            if error is not None:
+                raise RuntimeError(str(error))
+            event = json.loads(message.value())
+            if event["event_type"] != "OrderPlaced":
+                raise ValueError(f"unexpected event type: {event['event_type']}")
+            event_id = event["event_id"]
+            data = event["data"]
+            with common.connect() as connection:
+                with connection.transaction():
+                    claimed = connection.execute(
+                        """
+                        INSERT INTO processed_events (consumer_group, event_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (consumer_group, event_id) DO NOTHING
+                        RETURNING event_id
+                        """,
+                        (GROUP, event_id),
+                    ).fetchone()
+                    if claimed is not None:
+                        updated = connection.execute(
+                            """
+                            UPDATE inventory
+                            SET available = available - %s, updated_at = now()
+                            WHERE sku = %s AND available >= %s
+                            RETURNING sku
+                            """,
+                            (data["quantity"], data["sku"], data["quantity"]),
+                        ).fetchone()
+                        if updated is None:
+                            raise RuntimeError(f"insufficient inventory for {data['sku']}")
+                        connection.execute(
+                            """
+                            INSERT INTO inventory_adjustments
+                                (consumer_group, event_id, sku, quantity_delta)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (GROUP, event_id, data["sku"], -data["quantity"]),
+                        )
+            consumer.commit(message=message, asynchronous=False)
+    finally:
+        consumer.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+A redelivered event loses the insert race in `processed_events`, so it writes no
+second stock adjustment. Insufficient inventory raises before the Kafka commit;
+the operational policy for that failure belongs to a later retry and dead-letter
+project.
+
+## 5. Run and verify
+
+Place an order and inspect the database and inventory:
+
+```bash
+curl -i -X POST http://127.0.0.1:8000/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"c-1","sku":"sku-1","quantity":2,"amount":"25.00"}'
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT order_id, aggregate_version FROM orders ORDER BY created_at;"
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT id, aggregate_id, aggregate_version, published FROM orders_outbox ORDER BY id;"
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT sku, available FROM inventory WHERE sku = 'sku-1';"
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT consumer_group, event_id, count(*) FROM inventory_adjustments GROUP BY consumer_group, event_id;"
+```
+
+A successful run has one `OrderPlaced` adjustment and one inventory deduction.
+To test a replay, set an already published row back to `FALSE`, run the relay,
+and compare the adjustment count before and after; the count must stay one for
+that consumer group.
 
 ## Break it
 
-1. **The old way first.** Implement "INSERT order → COMMIT → produce" in a branch.
-   Kill the process between commit and produce. Consume the topic: **the event never
-   arrives** and nothing in the DB says different. That's the hole this pattern
-   closes — you've now *felt* the dual-write problem.
-2. **Kill the relay** mid-loop, place 20 orders, restart the relay. All 20 arrive;
-   `published` flips to TRUE; none lost. Explain why `flush()` before marking made
-   this true.
-3. **Duplicate delivery on purpose:** with `published=FALSE` still in a row, run the
-   relay again after the topic already has the record. Consumers see it twice —
-   then prove the dedup table swallowed the second copy.
-4. **Backfill test:** set `published=FALSE` for a historical row. Relay re-sends.
-   Replay is a feature, not a bug — note it.
+1. Implement the old order insert followed by a direct publish in a disposable
+   branch. Kill the process between commit and publish. The order exists with no
+   event, which is the dual-write hole the outbox closes.
+2. Kill the relay while 20 orders are pending. Restart it and confirm every
+   pending row is eventually published and marked.
+3. Force a row back to `FALSE` after its event was delivered. The relay publishes
+   it again; the inventory worker must skip the second adjustment.
+4. Add a second order event using version 2 and make the relay replicas compete.
+   Observe why `aggregate_version`, not the outbox sequence value, expresses the
+   order's history.
 
 ## Checkpoints
 
-??? question "1. Where exactly can duplicates come from in this design?"
-    Exactly one window, spelled out:
-    **Relay published → broker acked → crash before `published=TRUE`** — the row
-    is still `FALSE` at restart → relay re-publishes the *same* event. (Break-it
-    #3 does this on purpose.)
-    Everything else is safe by construction:
-    - crash *before* produce → nothing published; re-published once, no dup.
-    - produce fails (no ack) → no mark → retried; no dup.
-    - mark succeeds but produce happened twice — same as above, only window.
-    Second-order sources: (a) a *second relay replica* polling without
-    `SKIP LOCKED` (break-it #3's research point) → both publish the same row →
-    same dup; (b) consumer-side misbehavior — auto-commit with side effects
-    (P3's `processed_events`) is the *consumer's* duplicate absorber. Net: the
-    design guarantees **at-least-once to the broker, duplicates possible only in
-    the ack→mark window**, and P3 dedup converts them into no-ops.
+??? question "What is the atomic boundary?"
+    The order row and its outbox row commit together. Kafka is outside that
+    transaction, but an unpublished row remains durable work for the relay.
 
-??? question "2. Why `ORDER BY id` and not `created_at`?"
-    Because **commit-order and wall-clock order are not the same thing**.
-    - `id` (BIGSERIAL) is assigned and increases in *transaction commit order* —
-      polling by ascending `id` replays events exactly in the order the business
-      committed them (the deliverable ordering, P2 law).
-    - `created_at` is set *at insert time* — within the same commit burst two
-      rows can share a timestamp (tie → nondeterministic pickup), and with any
-      clock skew (NTP jitter, multi-node app) a *later-committed* event can carry
-      an *earlier* timestamp → the relay publishes it first → consumers see the
-      story out of order (`OrderCancelled` before `OrderPlaced`). Ordering is a
-      factual guarantee — never derive it from a clock.
+??? question "Why flush before marking?"
+    `flush()` waits for delivery callbacks. Marking first could lose the event if
+    the broker rejects it. Marking after an acknowledgment can duplicate it, and
+    the consumer claim absorbs that duplicate.
 
-??? question "3. Two relay replicas poll the same table with `SKIP LOCKED` — what breaks if you forget it? (Research `FOR UPDATE SKIP LOCKED` and implement it.)"
-    Without `SKIP LOCKED`: both replicas run `SELECT ... WHERE published=FALSE
-    ORDER BY id LIMIT 100` → both see the same 100 rows → both produce the same
-    100 events → then both mark → **every row delivered twice**. (Worse: with
-    `FOR UPDATE` alone they'd *block each other* — serialized, inefficient, and
-    with a third replica a livelock risk.)
-    The fix: `SELECT ... FOR UPDATE SKIP LOCKED` — atomically takes a row lock,
-    skipping rows the other replica holds. Then each row has exactly one
-    "owned" poller; the other replica never sees it (blocked rows are skipped).
-    Residual reality: crash of the *owned* replica mid-publish-and-commit →
-    same ack→mark window → the *duplicate*, which dedup absorbs. `SKIP LOCKED`
-    doesn't remove the ack→mark dup; it removes the *both-publish* dup.
+??? question "What does `SKIP LOCKED` prevent?"
+    Two relay replicas select different pending rows rather than both selecting
+    the same rows. It does not remove the acknowledgment-to-mark duplicate
+    window, and it does not by itself serialize different versions of one order.
 
-??? question "4. Your order events and stock events now travel in different topics. What single event could fix their consistency view — where does it live?"
-    The **saga-style completion event** — the one fact that says "both
-    succeeded for this order": e.g. `OrderConfirmed` (or the correlating
-    `StockReserved`+`PaymentCaptured` join point). It lives in the **order
-    service's outbox** (orders side of truth), emitted *after* its local
-    consumers observed both sides — that's the P6 "shipping service waits for
-    both" pattern (its `order_pipeline` table).
-    Put differently: the consistency *view* you want ("shipping-ready") can't be
-    derived from either topic alone — it's a third event that the business
-    state machine creates once both facts exist, and it must itself go through
-    an outbox (P4) to be *guaranteed*. One event, boringly placed: orders
-    outbox → `OrderConfirmed` topic → shipping consumer.
+??? question "Does `BIGSERIAL` equal commit order?"
+    No. Sequence allocation and transaction commit are different timelines. Use
+    `aggregate_version` under the order row's transaction to define per-order
+    order; Kafka then preserves that order for the keyed stream.
 
 ## Done when
 
-- [ ] Placed orders appear in Kafka *after* a relay crash/restart, none lost
-- [ ] `published` flips only post-ack (log the timing, see the gap)
-- [ ] Duplicate deliveries produce zero duplicate stock effects (SQL-proof)
-- [ ] You can explain "the outbox made the broker optional" in one sentence
+- [ ] An order and its event are committed in one database transaction.
+- [ ] A relay restart loses no pending event and marks only after acknowledgment.
+- [ ] A replayed event leaves inventory unchanged.
+- [ ] You can explain sequence allocation versus commit order.
 
-## Learn more
-
-- **Read** — [microservices.io — Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) — the pattern this project is built on.
-- **Read** — [The Dual-Write Problem](https://www.confluent.io/blog/dual-write-problem/) — the failure modes the outbox eliminates (or moves).
-- **Watch** — [Ins and Outs of the Outbox Pattern](https://www.youtube.com/watch?v=PkrzOR_tIQI) (Gunnar Morling) — the polling-publisher design's edge cases, in video.
-
-Next: **[P5 · Outbox with Debezium CDC](p05-outbox-cdc.md)** — the relay you never
-write.
+Next: **[P5 · Outbox with Debezium CDC](p05-outbox-cdc.md)**.

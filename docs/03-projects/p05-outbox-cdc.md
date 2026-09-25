@@ -1,210 +1,267 @@
 # P5 · Outbox with Debezium CDC
 
-**Read first:** [The Transactional Outbox Pattern](../02-concepts/outbox.md) →
-[schema-evolution](../02-concepts/schema-evolution.md) context if you use Avro later
+**Read first:** [The Transactional Outbox Pattern](../02-concepts/outbox.md)
 
-Same guarantee as P4 — DB commit == event guaranteed — but the relay is now
-**Debezium tailing the Postgres WAL**. No polling code, millisecond freshness, and
-an extra production component to care for. Build it, measure it, and compare.
+P5 keeps P4's business transaction and replaces only the publisher. PostgreSQL
+writes the outbox row in the same transaction as the order; Debezium reads the
+WAL and routes each insert to the existing `orders.events` topic.
 
-## What you build
+## Shared files and setup
 
-```mermaid
-flowchart LR
-    API["order service"] -->|"INSERT orders (+outbox)"| DB[("postgres<br/>WAL")]
-    DB -->|"replication slot"| D["Debezium connector<br/>(Kafka Connect worker)"]
-    D -->|"routed: on insert → topic 'orders'"| K["kafka: orders"]
-    K --> W["inventory consumer (idempotent, P3)"]
-```
+Copy P4's complete `schema.sql`, `api.py`, `inventory_worker.py`, `common.py`, and
+outbox contract unchanged. Do not add a `published` update handler and do not
+change the event envelope. P4's `relay.py` is not part of the CDC path.
 
-| Skill | Learned by |
-|-------|-----------|
-| Kafka Connect worker + Debezium container | docker compose, logs |
-| Replication slots & WAL | `pg_replication_slots`, slot churn |
-| Outbox event router (topic routing, `aggregate_id` as key) | small_message_size routing config |
-| Ordering across the CDC topic | partition + key behavior vs P4 |
-| Initial snapshot vs streaming | connector snapshot phase |
-| Connector failure behavior | break-it: stop connector, pending events pile |
+This complete second file is an alternate stack for P5. It keeps the shared
+`INTERNAL` and `EXTERNAL` Kafka listeners, and gives the one-broker Connect
+cluster replication factor one for all of its internal topics. Use it instead
+of starting the shared Compose file at the same time.
 
-## Steps
+```yaml title="compose.connect.yaml"
+name: kafka-postgres-lab-cdc
 
-### 1. docker-compose additions
-
-```yaml
-  connect:
-    image: debezium/connect:3.0
-    depends_on: [kafka, postgres]
-    ports: ["8083:8083"]
+services:
+  kafka:
+    image: apache/kafka:3.8.1
     environment:
-      BOOTSTRAP_SERVERS: kafka:9092
-      GROUP_ID: 1
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  connect:
+    image: quay.io/debezium/connect:3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: connect-cdc
       CONFIG_STORAGE_TOPIC: connect_configs
       OFFSET_STORAGE_TOPIC: connect_offsets
       STATUS_STORAGE_TOPIC: connect_statuses
-    volumes:
-      - ./connect-plugins:/kafka/connect
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_TOPIC_CREATION_ENABLE: "true"
+      KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      REST_ADVERTISED_HOST_NAME: connect
+      REST_PORT: "8083"
+
+volumes:
+  kafka-data:
+  postgres-data:
 ```
 
-Requires Postgres `wal_level=logical` (add to compose or run `ALTER SYSTEM` +
-restart).
-
-### 2. Same outbox table (P4's stays unchanged — that's the point)
-
-```sql
-CREATE TABLE orders_outbox (/* identical to P4 */);
-```
-
-Insert the P4 rows as usual; the *only* diff is what reads them.
-
-### 3. Register the connector (one curl)
+Start it, create the topic, and apply P4's unchanged schema:
 
 ```bash
-curl -X POST http://localhost:8083/connectors -H 'Content-Type: application/json' -d '{
+docker compose -f compose.connect.yaml up -d --wait --wait-timeout 180
+docker compose -f compose.connect.yaml exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --create --if-not-exists \
+  --topic orders.events --partitions 3 --replication-factor 1 \
+  --config min.insync.replicas=1
+docker compose -f compose.connect.yaml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
+```
+
+The Connect container uses `kafka:29092`; host Python still uses the shared
+`KAFKA_BOOTSTRAP_SERVERS=localhost:9092` setting.
+
+## Register the Debezium 3.x connector
+
+The connector is created only after the topic exists. The source topic prefix
+is retained for connector bookkeeping, while the Event Router replacement
+always sends the outbox payload to the fixed `orders.events` topic.
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:8083/connectors \
+  -H 'Content-Type: application/json' --data-binary @- <<'JSON'
+{
   "name": "outbox-orders",
   "config": {
     "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-    "database.hostname": "postgres", "database.port": "5432",
-    "database.user": "app", "database.password": "app",
-    "database.dbname": "app", "database.server.name": "dbserver",
-    "table.include.list": "public.orders_outbox",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "app",
+    "database.password": "app",
+    "database.dbname": "app",
     "topic.prefix": "dbserver",
+    "plugin.name": "pgoutput",
+    "table.include.list": "public.orders_outbox",
     "publication.name": "dbz_publication",
+    "publication.autocreate.mode": "filtered",
     "slot.name": "dbz_outbox",
+    "slot.drop.on.stop": "false",
+    "snapshot.mode": "no_data",
+    "skipped.operations": "u,d",
+    "tombstones.on.delete": "false",
     "transforms": "outbox",
     "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
-    "transforms.outbox.table.fields.additional.placement": "type:envelope:event_type",
-    "transforms.outbox.route.topic": "orders",
-    "transforms.outbox.route.by.field": "aggregate_id",
+    "transforms.outbox.route.by.field": "event_type",
+    "transforms.outbox.route.topic.regex": "(.*)",
+    "transforms.outbox.route.topic.replacement": "orders.events",
+    "transforms.outbox.table.field.event.id": "event_id",
     "transforms.outbox.table.field.event.key": "aggregate_id",
-    "transforms.outbox.table.field.event.id": "id",
     "transforms.outbox.table.field.event.payload": "payload",
-    "skipped.operation": "delete"
-  }}'
+    "transforms.outbox.table.fields.additional.placement": "event_type:header:event_type"
+  }
+}
+JSON
 ```
 
-The **EventRouter** turns each outbox row into a Kafka event: topic `orders`,
-key = `aggregate_id`, value = the JSON `payload` verbatim. One connector, zero
-application code. Check health:
+Check the exact status and connector configuration:
 
 ```bash
-curl http://localhost:8083/connectors/outbox-orders/status
-# "state": "RUNNING", tasks: [{"state": "RUNNING"}]
+curl --fail-with-body http://127.0.0.1:8083/connectors/outbox-orders/status
+curl --fail-with-body http://127.0.0.1:8083/connectors/outbox-orders/config
 ```
 
-### 4. Observe the magic
+A healthy response has connector state `RUNNING` and task state `RUNNING`.
+`route.topic.replacement` is the current fixed-topic property;
+`route.topic` and the old `database.server.name` setting are not used.
+`skipped.operations` is plural. The event ID is P4's `event_id`, and the Kafka
+key is P4's `aggregate_id`.
 
-Place an order → event appears in `orders` within milliseconds (not 100ms polling).
+## Start P4's unchanged path
+
+Start P4's API and consumer in separate terminals, then place an order only
+after the connector is running:
 
 ```bash
-kcat -b localhost:9092 -t orders -C -f 'key=%k value=%s\n'
+python -m uvicorn api:app --host 127.0.0.1 --port 8000
+python inventory_worker.py
 ```
 
-Watch the connector's snapshot phase in logs when the topic first starts flowing
-(`docker compose logs connect | grep -i snapshot`).
+```bash
+ORDER_ID="$(curl -sS -X POST http://127.0.0.1:8000/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"c-1","sku":"sku-1","quantity":2,"amount":"25.00"}' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["order_id"])')"
+printf '%s\n' "$ORDER_ID"
+docker compose -f compose.connect.yaml exec kafka \
+  /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 \
+  --topic orders.events --from-beginning --max-messages 1
+```
 
-### 5. Compare against P4 — the honest report
+The value is the P4 envelope, not a Debezium wrapper. The connector filters
+updates and deletes because P4 later marks a row `published`; otherwise that
+maintenance update would become a second routed event. `snapshot.mode=no_data`
+also prevents a new connector from replaying every historical outbox row. If a
+historical bootstrap is intentional, choose `initial` deliberately and expect
+P4's consumer dedup to absorb the replay. A running connector must see the API
+insert; an insert made before `no_data` starts is not a stream event.
 
-| Criterion | P4 polling | P5 CDC |
-|-----------|-----------|--------|
-| End-to-end latency | ~poll interval (1–10 Hz > 100ms) | ~ms |
-| Components to run | relay code (yours) | Connect worker + Debezium + slot |
-| Failure modes you own | relay bugs | slots, connector config, schema changes |
-| Ordering | `ORDER BY id` (insert order) | per-partition, key-derived; outbox `id` not exposed after routing — think! |
-| Debugging | `published` column | connector status + `dbserver.public.orders_outbox` source topic |
+## WAL, publication, and slot checks
 
-## Break it
+```bash
+docker compose -f compose.connect.yaml exec postgres psql -U app -d app \
+  -c 'SHOW wal_level;'
+docker compose -f compose.connect.yaml exec postgres psql -U app -d app \
+  -c 'SELECT slot_name, plugin, slot_type, active, confirmed_flush_lsn FROM pg_replication_slots;'
+docker compose -f compose.connect.yaml exec postgres psql -U app -d app \
+  -c 'SELECT pubname FROM pg_publication WHERE pubname = '\''dbz_publication'\'';'
+docker compose -f compose.connect.yaml exec postgres psql -U app -d app \
+  -c 'SELECT application_name, state, sent_lsn, write_lsn FROM pg_stat_replication;'
+docker compose -f compose.connect.yaml logs --tail=80 connect
+```
 
-1. **Stop the Connect worker,** place 20 orders. Restart worker. Events flush.
-   What state did you lose? None — the slot held the position. *Who* lost the
-   position if you `DELETE` the slot instead? (Run `SELECT * FROM pg_replication_slots`.)
-2. **Abandoned slots:** create a connector with a typo'd slot name, then delete the
-   connector. Check WAL growth (slot prevented cleanup). Deleting a connector does
-   **not** drop the slot — do it by hand and observe the WAL release.
-3. **Payload mutation:** add a column to `orders_outbox` (e.g. `z`). Debezium tolerates
-   some, errors on others; watch the connector state and connector restart with a
-   schema update path you choose.
-4. **Duplicate consistency:** while a connector is paused, P4' style re-publish —
-   consumers dedup (P3) so nothing double-applies. Verify.
+The slot retains WAL while the connector is stopped. Deleting a Connect
+connector does not drop its PostgreSQL slot. Delete the connector, verify the
+slot, and remove it deliberately when it is retired:
 
-## Checkpoints
+```bash
+curl --fail-with-body -X DELETE http://127.0.0.1:8083/connectors/outbox-orders
+curl --fail-with-body http://127.0.0.1:8083/connectors/outbox-orders/status
+  || true
+docker compose -f compose.connect.yaml exec postgres psql -U app -d app \
+  -c "SELECT pg_drop_replication_slot('dbz_outbox');"
+```
 
-??? question "1. What exactly does the `aggregate_id` field in the EventRouter do to ordering? (Revisit [ordering](../02-concepts/ordering.md).)"
-    It becomes the **partition key of the routed event** — `route.by.field:
-    aggregate_id` makes the source of the key the outbox row's `aggregate_id`,
-    and in the same breath `table.field.event.key: aggregate_id` says "use that
-    row field as the Kafka message key". Result: all events *of the same
-    aggregate* land on the **same partition, in outbox-`id` (insert) order** —
-    the per-entity ordering law survives the CDC hop even though the
-    connector batches records across many aggregates into the topic.
-    The P4-comparison wrinkle (step 5 table): P4's relay guaranteed
-    aggregate-order by `ORDER BY id`; CDC guarantees **per-aggregate order by
-    key routing**, and *global* cross-aggregate order is meaningless anyway
-    (Kafka never guarantees it) — so they're equivalent for every consumer that
-    cares about entity history. If you want a second dimension (e.g. time-ordered
-    reads per aggregate for projections), that's a *projection* concern, not the
-    topic's.
+## Verify P4 consumer deduplication
 
-??? question "2. A connector emits the *same* outbox row twice after a node restart. Where's the dedup again? (It shouldn't be your DB's fault.)"
-    Same place it always is: the **consumer's `processed_events` table** (P3)
-    — *event_id* is the key. The connector's restart (re-boot, offset revisit)
-    can re-emit a row; the *consumer* records `event_id` (P4's `event_id`
-    payload field) and applies the side effect only on first sight, so the
-    double-emission is a no-op for every consumer with the P3 guard.
-    What an *unprotected* consumer would experience: double stock deduction.
-    That's exactly why P5's own table says "consumer idempotency is not
-    optional here" — CDC is *less* controlled than your own relay, so dedup
-    isn't a belt-and-braces, it's the plan.
-    (Fun detail: the connector's own offset — in `connect_offsets` — is its
-    dedup against the WAL, but that protects the *connector*, not the *consumer*;
-    those are different contracts.)
+CDC can replay an event after a connector or consumer restart. The unchanged
+P4 `inventory_worker.py` must still write one adjustment. This deliberately
+uses P4's relay once, only as a duplicate generator; it is not the P5 runtime.
 
-??? question "3. Which config keys decide 'topic per outbox row' vs 'one topic for everything'?"
-    The `outbox` transform's routing trio, all in the connector config:
-    - **`transforms.outbox.route.topic`** — the *base topic* (or template) a row
-      targets; with a template like `orders.%s` you route by a field's value.
-    - **`transforms.outbox.route.by.field`** — which row field selects the
-      *destination* (`event_type` → per-event-type topics; `aggregate_id` is
-      usually used with the *key* config, not the route).
-    - **`transforms.outbox.route.topic.regex` / `route.topic.replacement`** —
-      regular-expression rewriting of the routed topic name (e.g.
-      `(.*)_outbox` → `$1` to strip the suffix).
-    So: one topic for everything = a **static `route.topic`** value (P5's
-    `orders`); topic-per-event-type = `route.by.field: event_type` with topic
-    template; hybrid custom mappings use the regex pair. Default EventRouter
-    behavior without `route.by.field`: reserves `type` as the routing field.
+```bash
+docker compose -f compose.connect.yaml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "UPDATE orders_outbox SET published = FALSE WHERE aggregate_id = '$ORDER_ID';"
+timeout 5s python relay.py || test "$?" -eq 124
+docker compose -f compose.connect.yaml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT event_id, count(*) AS adjustments FROM inventory_adjustments WHERE event_id = 'order-$ORDER_ID-placed' GROUP BY event_id;"
+docker compose -f compose.connect.yaml exec -T postgres \
+  psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT consumer_group, event_id FROM processed_events WHERE event_id = 'order-$ORDER_ID-placed';"
+```
 
-??? question "4. Slot vs offset: which one is Kafka's birthright, which one is Postgres' entry management? When do they drift?"
-    **Slot** = Postgres' contract: a named, durable bookmark in the *WAL*
-    (`pg_replication_slots`) — it tells Postgres "don't discard WAL older than
-    this". If a connector dies, Postgres *keeps the WAL* → nothing lost, but WAL
-    grows (break-it #2 measured that). Deleting the connector **does not delete
-    the slot** — the row must be dropped by hand, then Postgres reclaims the
-    WAL.
-    **Offset** = Kafka's contract: Connect consumers check their start position
-    in `connect_offsets` *before* consulting the slot. If the offset lags the
-    slot, the connector resumes from the offset (not from the slot's head) —
-    those events were already *emitted*, so it works.
-    **Drift**: the two represent different resume points — slot = "WAL position
-    a connector will re-read if its offsets are gone"; offset = "topic position
-    it actually resumed from". They drift when: offsets get deleted (restart
-    from slot → full re-emit), or the slot lags far behind the offsets (WAL
-    bloat while nothing consumes). The hygiene rule: **keep the slot alive only
-    while a live connector owns it; drop it the moment the connector retires** —
-    and never let the slot outrun your offsets (that's the "abandoned slot/pile
-    of WAL" failure).
+The first query returns one row with `adjustments = 1`, and the processed-event
+claim exists. A second CDC emission is therefore harmless. The source key keeps
+all events for one order on one partition; it does not create a global order.
 
-## Done when
+## Operational notes
 
-- [ ] Orders appear in `orders` topic < 50ms after POST with zero relay code
-- [ ] You can explain the EventRouter config line by line
-- [ ] You have seen and cleaned up an abandoned replication slot
-- [ ] You wrote a one-paragraph "polling vs CDC" decision note for your team
+- Stopping Connect pauses WAL retention at the slot, not event delivery. Monitor
+  slot age and WAL bytes before deleting a connector.
+- A schema change can require connector review. Test it before changing the
+  outbox columns; the P4 contract is intentionally unchanged here.
+- P4's `published` flag is not a CDC acknowledgement and stays `FALSE` in this
+  path. Do not run a polling relay alongside the connector.
 
-## Learn more
-
-- **Docs** — [Debezium — Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) — the transformation at the heart of this project, reference form.
-- **Read** — [Reliable Microservices Data Exchange with the Outbox Pattern](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/) — a production walkthrough of exactly this architecture.
-- **Watch** — [Ins and Outs of the Outbox Pattern](https://www.youtube.com/watch?v=PkrzOR_tIQI) (Gunnar Morling) — Debezium outbox live, with the failure analysis.
-
-Next: **[P6 · Saga by Choreography](p06-saga-choreography.md)** — multi-service
-workflow, first decentralized.
+Next: **[P6 · Saga by Choreography](p06-saga-choreography.md)**.

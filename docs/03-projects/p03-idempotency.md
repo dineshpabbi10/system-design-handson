@@ -3,210 +3,297 @@
 **Read first:** [Idempotency](../02-concepts/idempotency.md) →
 [Delivery semantics](../02-concepts/delivery-semantics.md)
 
-Your first *real* business system: payments. Money must never be charged twice —
-neither when the HTTP layer retries, nor when Kafka redelivers.
+Make HTTP retries replay one payment and Kafka redelivery write one ledger row.
 
 ## What you build
 
 ```mermaid
 flowchart LR
-    C["clients / curl retries"] -->|"POST /payments<br/>Idempotency-Key header"| API["FastAPI payments service"]
-    API --> DB[("postgres: payments +<br/>idempotency_keys +<br/>processed_events")]
-    API -->|"PaymentCaptured"| K["kafka: payments"]
-    K --> W["consumer: ledger writer"]
-    W --> DB
+    C["curl retries"] --> A["api.py"]
+    A --> D[("payments and keys")]
+    A --> K["payments topic"]
+    K --> W["worker.py"]
+    W --> L[("claims and ledger")]
 ```
 
-| Skill | Learned by |
-|-------|-----------|
-| Idempotency-Key flow, racing retries | concurrent curl + UNIQUE constraint |
-| Response replay | same key → same stored response |
-| Same key / different body | 422 path |
-| At-least-once consumer dedup | `processed_events` unique table |
-| Crash between effect and ack | break-it experiment |
+## Shared files and setup
 
-## Steps
+Copy the shared `compose.yaml` and `common.py` unchanged from
+[Setup](../01-fundamentals/setup.md). Add:
 
-### 1. Schema
+```text
+compose.yaml
+common.py
+requirements.txt
+schema.sql
+events.py
+api.py
+worker.py
+```
 
-```sql
-CREATE TABLE payments (
-  payment_id    UUID PRIMARY KEY,
-  order_id      TEXT NOT NULL,
-  amount        NUMERIC(12,2) NOT NULL,
-  status        TEXT NOT NULL CHECK (status IN ('pending','captured','failed')),
-  created_at    TIMESTAMPTZ DEFAULT now()
+```bash
+docker compose up -d --wait --wait-timeout 180
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --create --if-not-exists \
+  --topic payments --partitions 3 --replication-factor 1 \
+  --config min.insync.replicas=1
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
+```
+
+Run `python -m uvicorn api:app --host 127.0.0.1 --port 8000` and
+`python worker.py` in separate terminals.
+
+## 1. `schema.sql`
+
+```sql title="schema.sql"
+CREATE TABLE IF NOT EXISTS payments (
+  payment_id UUID PRIMARY KEY,
+  order_id TEXT NOT NULL,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'captured', 'failed')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE idempotency_keys (
-  key            TEXT PRIMARY KEY,
-  request_hash   TEXT NOT NULL,
-  status         TEXT NOT NULL,             -- 'in_progress' | 'completed'
-  response       JSONB,
-  created_at     TIMESTAMPTZ DEFAULT now()
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key TEXT PRIMARY KEY,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('in_progress', 'completed')),
+  response JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE processed_events (             -- consumer-side dedup
-  event_id       TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS processed_events (
   consumer_group TEXT NOT NULL,
-  processed_at   TIMESTAMPTZ DEFAULT now(),
-  UNIQUE (event_id, consumer_group)
+  event_id TEXT NOT NULL,
+  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer_group, event_id)
+);
+CREATE TABLE IF NOT EXISTS payment_ledger (
+  ledger_id BIGSERIAL PRIMARY KEY,
+  payment_id UUID NOT NULL REFERENCES payments(payment_id),
+  consumer_group TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  amount NUMERIC(12,2) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (consumer_group, event_id)
 );
 ```
 
-### 2. The write path (one transaction, one constraint)
+The composite key scopes a consumer claim to one group and one event.
 
-```python
+## 2. `events.py`
+
+This is the missing event-generation path. The builder calls
+`common.make_event`; its event ID is stable because it is derived from the payment ID.
+
+```python title="events.py"
+from typing import Any
+import common
+
+def build_payment_captured(payment_id: str, order_id: str, amount: str) -> dict[str, Any]:
+    return common.make_event(
+        event_id=f"payment-{payment_id}",
+        event_type="PaymentCaptured",
+        aggregate_type="payment",
+        aggregate_id=payment_id,
+        data={"payment_id": payment_id, "order_id": order_id, "amount": amount},
+    )
+```
+
+## 3. `api.py`
+
+The payment and idempotency response commit together. `publish_payment` runs
+after that transaction, and a replay republishes the same stable event.
+
+```python title="api.py"
+import hashlib
+import json
+from decimal import Decimal
+from typing import Any
+from uuid import uuid4
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+import common
+import events
+
+app = FastAPI()
+TOPIC = "payments"
+
+class PaymentRequest(BaseModel):
+    order_id: str
+    amount: Decimal = Field(gt=0)
+
+def request_hash(request: PaymentRequest) -> str:
+    body = json.dumps({"order_id": request.order_id, "amount": str(request.amount)},
+                      sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+def publish_payment(response: dict[str, Any]) -> None:
+    event = events.build_payment_captured(
+        response["payment_id"], response["order_id"], response["amount"]
+    )
+    common.publish(common.new_producer("p03-payment-api"), TOPIC, event)
+
 @app.post("/v1/payments")
-async def create_payment(req: PaymentRequest, idempotency_key: str = Header(...)):
-    body_hash = sha256(json.dumps(req.model_dump()).encode()).hexdigest()
-    async with db.transaction():
-        inserted = await db.fetchrow(
-            "INSERT INTO idempotency_keys (key, request_hash, status) "
-            "VALUES ($1, $2, 'in_progress') "
-            "ON CONFLICT (key) DO NOTHING RETURNING key", idempotency_key, body_hash)
-        if inserted is None:                          # replay of an existing key
-            existing = await db.fetchrow(
-                "SELECT * FROM idempotency_keys WHERE key = $1", idempotency_key)
-            if existing["request_hash"] != body_hash:
-                raise HTTPException(422, "same key but different body")
-            return JSONResponse(existing["response"], status_code=200)
-        payment_id = str(uuid4())
-        await db.execute("INSERT INTO payments (payment_id, order_id, amount, status)"
-                         " VALUES ($1,$2,$3,'captured')",
-                         payment_id, req.order_id, req.amount)
-        response = {"payment_id": payment_id, "status": "captured"}
-        await db.execute(
-            "UPDATE idempotency_keys SET status='completed', response=$1 "
-            "WHERE key = $2", response, idempotency_key)
-        return response
+def create_payment(request: PaymentRequest, idempotency_key: str = Header()) -> JSONResponse:
+    body_hash = request_hash(request)
+    created = False
+    with common.connect() as connection:
+        with connection.transaction():
+            inserted = connection.execute(
+                "INSERT INTO idempotency_keys (key, request_hash, status) "
+                "VALUES (%s, %s, 'in_progress') ON CONFLICT (key) DO NOTHING RETURNING key",
+                (idempotency_key, body_hash),
+            ).fetchone()
+            if inserted is None:
+                existing = connection.execute(
+                    "SELECT request_hash, status, response FROM idempotency_keys "
+                    "WHERE key = %s FOR UPDATE", (idempotency_key,)
+                ).fetchone()
+                if existing is None:
+                    raise HTTPException(status_code=409, detail="request is in progress")
+                if existing["request_hash"] != body_hash:
+                    raise HTTPException(status_code=422, detail="same key, different body")
+                if existing["status"] != "completed":
+                    raise HTTPException(status_code=409, detail="request is in progress")
+                response = existing["response"]
+            else:
+                payment_id = str(uuid4())
+                response = {"payment_id": payment_id, "order_id": request.order_id,
+                            "amount": str(request.amount), "status": "captured"}
+                connection.execute(
+                    "INSERT INTO payments (payment_id, order_id, amount, status) "
+                    "VALUES (%s, %s, %s, 'captured')",
+                    (payment_id, request.order_id, request.amount),
+                )
+                connection.execute(
+                    "UPDATE idempotency_keys SET status = 'completed', response = %s "
+                    "WHERE key = %s", (common.jsonb(response), idempotency_key)
+                )
+                created = True
+    publish_payment(response)
+    return JSONResponse(response, status_code=201 if created else 200)
 ```
 
-**Why this is correct:** the charge (`payments` row) and the idempotency contract
-commit atomically. A crash *after* commit → client retries → we read the stored
-response and return it. A crash *before* commit → nothing happened → clean retry.
+`ON CONFLICT` is the concurrency guard. A database-to-Kafka dual-write window
+still exists: a process can die after the database commit and before
+`common.publish`, leaving a payment without an event. A retry repairs it, but
+independent systems are not atomic. P4 stores the event in the same transaction
+and publishes it later.
 
-### 3. Produce the event, dedup the event
+## 4. `worker.py`
 
-After payment is captured, publish `PaymentCaptured` with a stable event id
-(`f"payment-{payment_id}"`). Consumer:
+The worker claims `(consumer_group, event_id)` and writes a real ledger row in
+that same transaction before committing the Kafka offset.
 
-```python
-def on_message(msg):
-    evt = json.loads(msg.value())
-    event_id = evt["event_id"]                # 'payment-<id>'
-    with db.transaction():
-        row = await db.fetchrow(
-            "INSERT INTO processed_events (event_id, consumer_group) "
-            "VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING event_id",
-            event_id, GROUP)
-        if row:                               # first time → apply side effect
-            await db.execute(
-                "UPDATE payments SET status='captured' WHERE payment_id=$1",
-                evt["payment_id"])
-    consumer.commit(asynchronous=False)
+```python title="worker.py"
+import json
+from confluent_kafka import Consumer
+import common
+
+TOPIC = "payments"
+GROUP = "payment-ledger"
+
+def main() -> None:
+    consumer = Consumer({"bootstrap.servers": "localhost:9092", "group.id": GROUP,
+                         "auto.offset.reset": "earliest",
+                         "enable.auto.offset.commit": False})
+    consumer.subscribe([TOPIC])
+    try:
+        while True:
+            message = consumer.poll(1.0)
+            if message is None:
+                continue
+            error = message.error()
+            if error is not None:
+                raise RuntimeError(str(error))
+            event = json.loads(message.value())
+            event_id = event["event_id"]
+            data = event["data"]
+            with common.connect() as connection:
+                with connection.transaction():
+                    claimed = connection.execute(
+                        "INSERT INTO processed_events (consumer_group, event_id) "
+                        "VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) "
+                        "DO NOTHING RETURNING event_id", (GROUP, event_id)
+                    ).fetchone()
+                    if claimed is not None:
+                        connection.execute(
+                            "INSERT INTO payment_ledger "
+                            "(payment_id, consumer_group, event_id, amount) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (data["payment_id"], GROUP, event_id, data["amount"]),
+                        )
+                        connection.execute(
+                            "UPDATE payments SET status = 'captured' WHERE payment_id = %s",
+                            (data["payment_id"],),
+                        )
+            consumer.commit(message=message, asynchronous=False)
+    finally:
+        consumer.close()
+
+if __name__ == "__main__":
+    main()
 ```
 
-*Parallelism note:* same `event_id` can never arrive twice simultaneously to one
-group (one partition owns it); different groups share nothing. The constraint
-protects the replay path and rebalances.
+A crash after the transaction but before the Kafka commit causes a safe replay;
+a failed transaction leaves neither claim nor ledger row.
 
-### 4. Test harness
+## 5. Curl and SQL checks
 
 ```bash
-KEY=$(uuidgen)
-curl -s -X POST localhost:8000/v1/payments -H "Idempotency-Key: $KEY" \
-  -d '{"order_id":"o1","amount":100}'
-curl -s -X POST localhost:8000/v1/payments -H "Idempotency-Key: $KEY" \
-  -d '{"order_id":"o1","amount":100}'     # same response, same payment_id
-curl -s -X POST localhost:8000/v1/payments -H "Idempotency-Key: $KEY" \
-  -d '{"order_id":"o1","amount":999}'     # → 422
+export KEY="$(python -c 'import uuid; print(uuid.uuid4())')"
+curl -i -X POST http://127.0.0.1:8000/v1/payments \
+  -H "Idempotency-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"order_id":"o1","amount":"100.00"}'
+curl -i -X POST http://127.0.0.1:8000/v1/payments \
+  -H "Idempotency-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"order_id":"o1","amount":"100.00"}'
+curl -i -X POST http://127.0.0.1:8000/v1/payments \
+  -H "Idempotency-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"order_id":"o1","amount":"999.00"}'
+for number in $(seq 1 20); do
+  curl -s -X POST http://127.0.0.1:8000/v1/payments \
+    -H "Idempotency-Key: $KEY" -H 'Content-Type: application/json' \
+    -d '{"order_id":"o1","amount":"100.00"}' &
+done
+wait
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT count(*) AS payment_rows FROM payments WHERE order_id = 'o1';"
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT key, status, response FROM idempotency_keys WHERE key = '$KEY';"
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT event_id, count(*) AS ledger_rows FROM payment_ledger GROUP BY event_id;"
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app \
+  -c "SELECT consumer_group, event_id, count(*) FROM payment_ledger GROUP BY consumer_group, event_id HAVING count(*) > 1;"
 ```
 
-```bash
-# concurrency: 20 parallel identical retries — how many payments rows exist?
-for i in $(seq 1 20); do curl -s -X POST localhost:8000/v1/payments \
-  -H "Idempotency-Key: $KEY" -d '{"order_id":"o1","amount":100}' & done; wait
-psql -c "SELECT count(*) FROM payments WHERE order_id='o1';"   # must be 1
-```
+The payment count is one. The second request republishes the same event ID, but
+the ledger duplicate query returns no rows.
 
 ## Break it
 
-1. **Crash between capture and response?** Kill the API process (SIGKILL) at the
-   point after DB commit, before return. Restart, retry with the same key → returned
-   response refers to the *same* payment row. Prove it with SQL.
-2. **Delete the `processed_events` row** for an event and let it redeliver —
-   replication of a side effect may happen once; prove your constraint is the hero.
-3. **Cross-group storm:** run two consumers in *different* groups on `payments`
-   topic writing to the same `payments` table. Concurrency duplication attempt —
-   now the DB constraint is the only thing saving you. Soak it in.
-4. **Replay:** produce the same event manually with `kcat`, verify idempotent skip.
+1. Kill the API after commit and before publish, then retry the same key.
+2. Delete a claim, republish its event, and verify the ledger constraint.
+3. Run another group and explain its independent claim scope.
+4. Reuse the key with a changed body and verify the request hash.
 
 ## Checkpoints
-
-??? question "1. Same key, same body, *different* time (yesterday, today) — acceptable? Under your TTL policy, explain."
-    **Not acceptable without a TTL.** The idempotency contract is "same request,
-    repeated" — "same request yesterday and today" is not the client retrying, it's
-    the client *re-issuing a new intent with a reused key*. If you blindly replay
-    the stored response you'd silently *drop a legitimate second payment* for the
-    same order (a second charge, a renewal, a resend).
-    Policy: the key table carries `created_at`; a replay is honored only within
-    the TTL window (commonly 15–60 min, at least longer than any client timeout +
-    network retry horizon). Outside TTL → treat it as a **new request**: delete
-    the stale row (or mint a new key mechanically) and process fresh — with a
-    documented rule that key reuse across business intents is a client bug.
-
-??? question "2. Your idempotency key table grows forever. Design the TTL + cleanup policy."
-    Two layers:
-    - **Row-level TTL/expiry**: mark the key with `expires_at = now() + TTL`
-      (e.g. 24 h). Cleanup options: a *lazy purge* (DELETE on replay — the
-      `ON CONFLICT` path checks `expires_at`), a **periodic sweep**
-      (`DELETE FROM idempotency_keys WHERE expires_at < now()` with LIMIT, on a
-      cron), or Postgres partition-per-day + drop old partitions.
-    - **Cardinality guard**: cap key table growth *rate* (per-client keys/hour
-      alert) — runaway key churn (a bug minting `uuid4()` per attempt) should
-      page you.
-    Keep "replayable history" only as long as your retry horizon demands — after
-    that, reuse is a fresh payment, not a replay (Q1).
-
-??? question "3. The client generates keys with `uuid4()`. Why not `hash(order_id)`?"
-    Because `hash(order_id)` is **derived from a single intent**: if the same
-    order legitimately needs *two* payments (split payment, split payment
-    attempt with different card, refund-then-recharge), the hash collides and
-    the second request is answered with the *first* stored response → a **real
-    payment silently dropped**. `uuid4()` gives *per-attempt identity*: every
-    retry of the *same attempt* reuses the same UUID (gets the replay), while a
-    *new attempt* on the same order gets a new key (gets new processing).
-    Rule: the idempotency key identifies the **attempt**, not the business
-    entity — and clients must coordinate retries *around* that attempt key.
-
-??? question "4. `payment_id` is in the response — but the client only sees the request. What if the same logical payment (same order) legitimately happens twice (refunds, recharges)? Key choices matter: when would you key on `order_id`?"
-    Two distinct idempotency *scopes*:
-    - **Attempt scope** (`uuid4()` per attempt): default choice. Doubles the
-      request → replay; a second *intent* (recharge) → distinct key → distinct
-      payment. Right for "one order, multiple payment intents".
-    - **Intent scope** (`key = order_id`): correct when the business invariant is
-      *"this order pays exactly once"* — the API *must not* allow a second charge
-      for the same order even if the client blunders (single-shot onboarding
-      fee, subscription first payment). The stored response then becomes the
-      source of truth for "paid" and re-keys naturally.
-    Extra guard for intent-scope keys: `request_hash` mismatch (same key, other
-    body) → 422 — the client must not change body mid-retry. The PPP: choose the
-    key to make the *duplicate* map to the *same* row — scope follows the
-    invariant you're protecting.
+??? question "What does the key identify?"
+    One client attempt. Same key and body replay; a new intent needs a new key.
+    Expire old keys according to the client retry horizon.
+??? question "Why publish after the transaction?"
+    The database commit is not held open by Kafka, but the commit-to-publish gap
+    remains. P4 removes that gap by storing the event in the same transaction.
+??? question "What does the claim protect?"
+    The pair `(consumer_group, event_id)` protects one group's side effect;
+    separate groups intentionally have separate scopes.
+??? question "Why `ON CONFLICT`?"
+    A unique constraint resolves racing inserts atomically; a prior check has a
+    race between check and write.
 
 ## Done when
 
-- [ ] 20 parallel identical requests → exactly 1 payment row (SQL-proof)
-- [ ] Retry after mid-crash returns identical payload, status 200
-- [ ] A redelivered Kafka event is skipped by the `processed_events` table
-- [ ] You can explain why "INSERT ... ON CONFLICT" is the guard, not a SELECT check
+- [ ] Concurrent retries create one payment, and replay creates one ledger row.
+- [ ] You can name the direct dual-write window and hand it to P4.
 
-## Learn more
-
-- **Read** — [How Stripe Works: Idempotency](https://stripe.com/blog/idempotency) (Brandur Leach) — the API you're reimplementing, flaws and all.
-- **Docs** — [Stripe API — Idempotent requests](https://docs.stripe.com/api/idempotent_requests) — the exact KEY header/response semantics to mirror.
-- **Read** — [Kafka Deduplication Patterns](https://www.lydtechconsulting.com/blog/kafka-deduplication-patterns---part-1-of-2) — reader-side dedup options when the API isn't yours to fix.
-
-Next: **[P4 · Transactional Outbox (polling publisher)](p04-outbox-polling.md)** —
-the moment DB writes and Kafka become one story.
+Next: **[P4 · Transactional Outbox](p04-outbox-polling.md)**.

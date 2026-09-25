@@ -1,228 +1,419 @@
 # P11 · Event-Sourced Bank
 
 **Read first:** [Event sourcing & CQRS](../02-concepts/event-sourcing-cqrs.md) →
-[Idempotency](../02-concepts/idempotency.md) (you'll need it)
+[Idempotency](../02-concepts/idempotency.md)
 
-Different paradigm, same muscles: a **bank ledger** where the *events themselves are
-the source of truth*. `balance` is a projection. You'll implement commands,
-event store, idempotent application, replay, and a CQRS read model — then push
-through Kafka to a consumer.
+The log is the truth; `balance` is a fold. Commands append versioned events
+with optimistic concurrency, one transaction also claims the command and
+queues the outbox row. Projections rebuild from the log.
 
 ## What you build
 
 ```mermaid
 flowchart LR
-    API["POST /accounts/1/withdraw<br/>(command, idempotency key)"] --> S["account service"]
-    S -->|"append events"| E[("event store (pg: account_events)")]
-    E -->|"project"| B[("balance_view (read model)")]
-    E -->|"outbox relay → kafka"| K["account_events topic"]
-    K --> L["ledger consumer →<br/>banking_api_sim / report projections"]
+    API["bank.py deposit/withdraw"] -->|"claim + append + outbox"| E[("account_events")]
+    E -->|"project"| B[("balance_view")]
+    E -->|"relay"| K["account_events topic"]
+    K --> L["ledger_consumer.py"]
 ```
 
 | Skill | Learned by |
 |-------|-----------|
-| Event store schema (aggregate_id, version, payload) | append-only + unique (agg, version) |
-| Optimistic concurrency (version check) | two concurrent withdrawals on same account |
-| Projections: balance view built by fold | SQL vs Python fold |
-| Replay / rebuild view from log | `TRUNCATE balance_view; REPLAY;` |
-| Idempotent command application | dedup via processed_events (P3) |
-| CQRS read model in Kafka | consumer projects events into report tables |
+| Versioned event store | `UNIQUE (account_id, event_version)` |
+| Idempotent commands | stable `command_id`, `ON CONFLICT` claim |
+| Optimistic retry | version conflict, refold, retry |
+| Correct money math | `Decimal`, deposit positive, withdraw negative |
+| Replay | full plus incremental projector |
 
-## Steps
-
-### 1. Event store
-
-```sql
-CREATE TABLE account_events (
-  id            BIGSERIAL PRIMARY KEY,
-  account_id    TEXT NOT NULL,
-  version       INT  NOT NULL,
-  event_type    TEXT NOT NULL,      -- AccountOpened | Deposited | Withdrawn | Closed
-  payload       JSONB NOT NULL,
-  created_at    TIMESTAMPTZ DEFAULT now(),
-  UNIQUE (account_id, version)      -- ← the concurrency guard
-);
-
-CREATE TABLE balance_view (          -- pure projection, rebuilt anytime
-  account_id   TEXT PRIMARY KEY,
-  balance      NUMERIC(12,2) NOT NULL,
-  version      INT  NOT NULL,
-  updated_at   TIMESTAMPTZ
-);
-```
-
-**The law**: writes only ever `INSERT INTO account_events`; the *balance* is never
-stored transactionally — it's recomputed (or replayed into the view).
-
-### 2. Command → event (with optimistic concurrency)
-
-```python
-async def withdraw(account_id, amount, idempotency_key):
-    async with db.transaction():
-        dup = await db.fetchrow(
-            "SELECT 1 FROM processed_events WHERE event_id=$1",
-            idempotency_key)
-        if dup: return {"status": "already_applied"}       # idempotent replay
-
-        version = await db.fetchval(
-            "SELECT version FROM account_events WHERE account_id=$1 "
-            "ORDER BY version DESC LIMIT 1 FOR UPDATE", account_id) or 0
-
-        event = {"account_id": account_id, "event_type": "Withdrawn",
-                 "payload": {"amount": amount, "at": now_iso()}, "version": version + 1}
-        try:
-            await db.execute(
-                "INSERT INTO account_events (account_id, version, event_type, payload)"
-                " VALUES ($1,$2,$3,$4)", account_id, version + 1, "Withdrawn", event["payload"])
-            await db.execute("INSERT INTO processed_events(event_id) VALUES ($1)", idempotency_key)
-        except UniqueViolation:
-            raise Conflict("concurrent write — retry with fresh fold")   # optimistic retry
-
-    project_balance(account_id, event)     # fold one event into balance_view
-```
-
-Concurrent withdrawal demo: two parallel withdraws → one hits
-`UNIQUE (account_id, version)` → conflict → **retry loop folds the newest event
-and re-applies** (classic optimistic concurrency; it's the same dance Kafka stream
-processors do).
-
-### 3. Projection: fold, yourself
-
-```python
-def project_balance(account_id):
-    # simplest correct version: fold over the whole stream
-    rows = db.fetchall("SELECT event_type, payload FROM account_events "
-                       "WHERE account_id=$1 ORDER BY version", account_id)
-    bal, v = Decimal(0), 0
-    for r in rows:
-        bal += r.payload["amount"] if r.event_type in ("Deposited", "Withdrawn-ish sign") else 0
-        v = r.version
-    db.execute("INSERT INTO balance_view VALUES ($1,$2,$3) "
-               "ON CONFLICT (account_id) DO UPDATE SET balance=$2, version=$3", ...)
-```
-
-(Then optimize: replay only rows > stored `version` — that's what the `version`
-column is for; explain the optimization in your notes.)
-
-### 4. Events leave the house (outbox relay → Kafka)
-
-Reuse P4's outbox: each committed event also inserts an outbox row →
-`account_events` topic (key=`account_id`) → **ledger consumer** projects into a
-`monthly_statements` report table (CQRS read model: statements computed from
-events by a different team/consumer, not from `balance_view`). Also — audit trail
-consumer: archives every event as JSON lines.
-
-### 5. Replay is the superpower
+## Setup
 
 ```bash
-scripts/replay.sh  # TRUNCATE balance_view;  replay all events;  compare to control
+export DATABASE_URL='postgresql://app:app@localhost:5432/app'
+export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
+docker compose up -d --wait --wait-timeout 180
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --create --if-not-exists \
+  --topic account_events --partitions 3 --replication-factor 1 \
+  --config min.insync.replicas=1
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
 ```
 
-Bug found in projection logic → re-run replay → views fixed. *Nothing else
-changes.* This is the pitch line of event sourcing — now you can promise it with a
-straight face.
+## 1. `schema.sql`
 
-## Break it
+```sql title="schema.sql"
+CREATE TABLE IF NOT EXISTS account_events (id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, event_version INTEGER NOT NULL CHECK (event_version > 0), event_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL CHECK (event_type IN ('AccountOpened', 'Deposited', 'Withdrawn')), payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (account_id, event_version));
+CREATE TABLE IF NOT EXISTS balance_view (account_id TEXT PRIMARY KEY, balance NUMERIC(12,2) NOT NULL, event_version INTEGER NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS processed_commands (command_id TEXT PRIMARY KEY, response JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS account_outbox (id BIGSERIAL PRIMARY KEY, aggregate_id TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, payload JSONB NOT NULL, published BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS account_outbox_pending_idx ON account_outbox (published, id) WHERE published = FALSE;
+CREATE TABLE IF NOT EXISTS processed_events (consumer_group TEXT NOT NULL, event_id TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (consumer_group, event_id));
+CREATE TABLE IF NOT EXISTS ledger_projection (account_id TEXT NOT NULL, event_version INTEGER NOT NULL, event_id TEXT NOT NULL, delta NUMERIC(12,2) NOT NULL, balance_after NUMERIC(12,2) NOT NULL, PRIMARY KEY (account_id, event_version));
+```
 
-1. **Concurrent withdraws** (same account, 10 parallel) → exactly one succeeds per
-   version; losers retry and succeed *later*, total & final balance match SQL math.
-2. **Replay race:** launch replay while a withdraw commits mid-flight → view
-   converges or conflicts; design choice: replay under an account-level lock
-   (accept it, implement it, note the tradeoff).
-3. **Duplicate command with same idempotency key** → `already_applied`, zero side
-   effects. (Replay P3 tautology: your constraint is the guard.)
-4. **Corrupt an event**: hand-edit `payload` of an old row (or insert an
-   `event_type='Earned'` you never defined) → consumer of the Kafka topic DLQs it
-   (P8) while your *DB* replay just... fails loudly on an unknown type. What's
-   your policy for "unknown event type, historic data"? (Schema registry P9 was
-   supposed to be involved — note it.)
+## 2. `bank.py`: claim, append, outbox in one transaction
+
+`command_id` comes from the caller and is stable across retries. `event_id`
+is `account_id` plus the attempted version, so a version retry gets a new
+deterministic event id without reusing the caller's key.
+
+```python title="bank.py"
+import argparse
+from decimal import Decimal
+from typing import Any
+import psycopg.errors
+import common
+
+GROUP = "bank-api"
+
+
+def next_version(connection: Any, account_id: str) -> int:
+    row = connection.execute(
+        "SELECT COALESCE(MAX(event_version), 0) AS max_version "
+        "FROM account_events WHERE account_id = %s",
+        (account_id,),
+    ).fetchone()
+    return int(row["max_version"]) + 1
+
+
+def apply_command(account_id: str, command_type: str, amount: Decimal, command_id: str) -> dict[str, Any]:
+    if command_type not in ("Deposited", "Withdrawn"):
+        raise ValueError(f"unknown command {command_type}")
+    if amount <= Decimal("0"):
+        raise ValueError("amount must be positive")
+    for attempt in range(5):
+        try:
+            with common.connect() as connection:
+                with connection.transaction():
+                    claimed = connection.execute(
+                        "INSERT INTO processed_commands (command_id, response) "
+                        "VALUES (%s, %s) ON CONFLICT (command_id) DO NOTHING "
+                        "RETURNING command_id",
+                        (command_id, common.jsonb({"status": "in_progress"})),
+                    ).fetchone()
+                    if claimed is None:
+                        existing = connection.execute(
+                            "SELECT response FROM processed_commands WHERE command_id = %s",
+                            (command_id,),
+                        ).fetchone()
+                        return dict(existing["response"])
+                    version = next_version(connection, account_id)
+                    event_id = f"{account_id}-v{version}"
+                    if command_type == "Deposited":
+                        delta = amount
+                    else:
+                        delta = -amount
+                    payload = {
+                        "event_id": event_id,
+                        "event_type": command_type,
+                        "aggregate_type": "account",
+                        "aggregate_id": account_id,
+                        "data": {
+                            "account_id": account_id,
+                            "amount": str(amount),
+                            "delta": str(delta),
+                            "event_version": version,
+                        },
+                    }
+                    connection.execute(
+                        "INSERT INTO account_events "
+                        "(account_id, event_version, event_id, event_type, payload) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (account_id, version, event_id, command_type, common.jsonb(payload)),
+                    )
+                    connection.execute(
+                        "INSERT INTO account_outbox (aggregate_id, event_id, payload) "
+                        "VALUES (%s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
+                        (account_id, event_id, common.jsonb(payload)),
+                    )
+                    response = {"status": "applied", "event_id": event_id, "event_version": version}
+                    connection.execute(
+                        "UPDATE processed_commands SET response = %s WHERE command_id = %s",
+                        (common.jsonb(response), command_id),
+                    )
+                    return response
+        except psycopg.errors.UniqueViolation:
+            if attempt == 4:
+                raise RuntimeError("concurrent write conflict after retries")
+            continue
+    raise RuntimeError("unreachable")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=["deposit", "withdraw"])
+    parser.add_argument("--account", required=True)
+    parser.add_argument("--amount", required=True)
+    parser.add_argument("--command-id", required=True)
+    args = parser.parse_args()
+    command_type = "Deposited" if args.command == "deposit" else "Withdrawn"
+    result = apply_command(args.account, command_type, Decimal(args.amount), args.command_id)
+    print(result)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+The `UNIQUE (account_id, event_version)` row is the optimistic guard. Two
+concurrent writers read the same max, one insert wins, the loser gets
+`UniqueViolation` and retries with a fresh version. No `SELECT`-then-insert
+guard is used; the constraint decides the race.
+
+Run the relay in another terminal with `python relay.py`:
+
+```python title="relay.py"
+import time
+import common
+
+TOPIC = "account_events"
+
+
+def main() -> None:
+    producer = common.new_producer("p11-account-relay")
+    with common.connect() as connection:
+        while True:
+            with connection.transaction():
+                rows = connection.execute("SELECT id, aggregate_id, payload FROM account_outbox WHERE published = FALSE ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED").fetchall()
+                for row in rows:
+                    common.publish(producer, TOPIC, row["payload"])
+                if rows:
+                    connection.execute("UPDATE account_outbox SET published = TRUE WHERE id = ANY(%s)", ([row["id"] for row in rows],))
+            time.sleep(0.1 if not rows else 0)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 3. `projector.py`: incremental and full
+
+```python title="projector.py"
+import argparse
+from decimal import Decimal
+from typing import Any
+import common
+
+
+def fold_account(connection: Any, account_id: str, from_version: int) -> tuple[Decimal, int]:
+    rows = connection.execute(
+        "SELECT event_type, payload, event_version FROM account_events "
+        "WHERE account_id = %s AND event_version > %s ORDER BY event_version",
+        (account_id, from_version),
+    ).fetchall()
+    balance = Decimal("0")
+    version = from_version
+    base = connection.execute(
+        "SELECT balance, event_version FROM balance_view WHERE account_id = %s",
+        (account_id,),
+    ).fetchone()
+    if base is not None and from_version == 0:
+        balance = Decimal(str(base["balance"]))
+        version = int(base["event_version"])
+    elif base is not None:
+        balance = Decimal(str(base["balance"]))
+        version = int(base["event_version"])
+    for row in rows:
+        payload = row["payload"]
+        data = payload["data"] if isinstance(payload, dict) and "data" in payload else {}
+        delta = Decimal(str(data.get("delta", "0")))
+        if row["event_type"] == "Deposited":
+            balance += abs(delta)
+        elif row["event_type"] == "Withdrawn":
+            balance -= abs(delta)
+        version = int(row["event_version"])
+    return balance, version
+
+
+def project_account(account_id: str) -> None:
+    with common.connect() as connection:
+        with connection.transaction():
+            current = connection.execute(
+                "SELECT event_version FROM balance_view WHERE account_id = %s",
+                (account_id,),
+            ).fetchone()
+            stored = int(current["event_version"]) if current is not None else 0
+            balance, version = fold_account(connection, account_id, stored)
+            if version == stored and current is not None:
+                return
+            connection.execute(
+                "INSERT INTO balance_view (account_id, balance, event_version) "
+                "VALUES (%s, %s, %s) ON CONFLICT (account_id) DO UPDATE SET "
+                "balance = EXCLUDED.balance, event_version = EXCLUDED.event_version, "
+                "updated_at = now()",
+                (account_id, balance, version),
+            )
+
+
+def rebuild_full() -> None:
+    with common.connect() as connection:
+        accounts = connection.execute(
+            "SELECT DISTINCT account_id FROM account_events ORDER BY account_id"
+        ).fetchall()
+    for row in accounts:
+        with common.connect() as connection:
+            with connection.transaction():
+                connection.execute("DELETE FROM balance_view WHERE account_id = %s", (row["account_id"],))
+        with common.connect() as connection:
+            with connection.transaction():
+                rows = connection.execute(
+                    "SELECT event_type, payload, event_version FROM account_events "
+                    "WHERE account_id = %s ORDER BY event_version",
+                    (row["account_id"],),
+                ).fetchall()
+                balance = Decimal("0")
+                version = 0
+                for item in rows:
+                    payload = item["payload"]
+                    data = payload["data"] if isinstance(payload, dict) and "data" in payload else {}
+                    delta = Decimal(str(data.get("delta", "0")))
+                    if item["event_type"] == "Deposited":
+                        balance += abs(delta)
+                    elif item["event_type"] == "Withdrawn":
+                        balance -= abs(delta)
+                    version = int(item["event_version"])
+                connection.execute(
+                    "INSERT INTO balance_view (account_id, balance, event_version) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (account_id) DO UPDATE SET "
+                    "balance = EXCLUDED.balance, event_version = EXCLUDED.event_version, "
+                    "updated_at = now()",
+                    (row["account_id"], balance, version),
+                )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--account")
+    parser.add_argument("--full", action="store_true")
+    args = parser.parse_args()
+    if args.full:
+        rebuild_full()
+        print("full rebuild done")
+    elif args.account:
+        project_account(args.account)
+        print(f"projected {args.account}")
+    else:
+        raise SystemExit("pass --account ID or --full")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Deposits add `abs(delta)`; withdrawals subtract `abs(delta)`. Both paths
+start `balance` at `Decimal("0")`, never an undefined variable.
+
+## 4. `ledger_consumer.py`: Kafka projection
+
+```python title="ledger_consumer.py"
+import json
+import os
+from decimal import Decimal
+from confluent_kafka import Consumer
+import common
+
+TOPIC = "account_events"
+GROUP = "ledger-projector"
+
+
+def main() -> None:
+    consumer = Consumer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "group.id": GROUP,
+            "auto.offset.reset": "earliest",
+            "enable.auto.offset.commit": False,
+        }
+    )
+    consumer.subscribe([TOPIC])
+    try:
+        while True:
+            message = consumer.poll(1.0)
+            if message is None:
+                continue
+            if message.error() is not None:
+                raise RuntimeError(str(message.error()))
+            event = json.loads(message.value())
+            event_id = event["event_id"]
+            data = event["data"]
+            account_id = event["aggregate_id"]
+            version = int(data["event_version"])
+            delta = Decimal(str(data["delta"]))
+            with common.connect() as connection:
+                with connection.transaction():
+                    claimed = connection.execute(
+                        "INSERT INTO processed_events (consumer_group, event_id) "
+                        "VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) "
+                        "DO NOTHING RETURNING event_id",
+                        (GROUP, event_id),
+                    ).fetchone()
+                    if claimed is None:
+                        consumer.commit(message=message, asynchronous=False)
+                        continue
+                    previous = connection.execute(
+                        "SELECT balance_after FROM ledger_projection "
+                        "WHERE account_id = %s ORDER BY event_version DESC LIMIT 1",
+                        (account_id,),
+                    ).fetchone()
+                    running = Decimal(str(previous["balance_after"])) if previous else Decimal("0")
+                    running += delta
+                    connection.execute(
+                        "INSERT INTO ledger_projection "
+                        "(account_id, event_version, event_id, delta, balance_after) "
+                        "VALUES (%s, %s, %s, %s, %s) "
+                        "ON CONFLICT (account_id, event_version) DO NOTHING",
+                        (account_id, version, event_id, delta, running),
+                    )
+            consumer.commit(message=message, asynchronous=False)
+    finally:
+        consumer.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 5. Run, replay, assert
+
+Start `python relay.py` and `python ledger_consumer.py` in separate terminals,
+then run the bank and projector commands below.
+
+```bash
+python bank.py deposit --account acct-1 --amount 100.00 --command-id cmd-acct-1-deposit-1
+python bank.py withdraw --account acct-1 --amount 30.00 --command-id cmd-acct-1-withdraw-1
+python bank.py deposit --account acct-1 --amount 100.00 --command-id cmd-acct-1-deposit-1
+python projector.py --account acct-1
+docker compose exec -T postgres psql -U app -d app \
+  -c "SELECT account_id, balance, event_version FROM balance_view WHERE account_id = 'acct-1';"
+docker compose exec -T postgres psql -U app -d app \
+  -c "SELECT account_id, event_version, event_id FROM account_events WHERE account_id = 'acct-1' ORDER BY event_version;"
+python projector.py --full
+docker compose exec -T postgres psql -U app -d app \
+  -c "SELECT account_id, balance, event_version FROM balance_view WHERE account_id = 'acct-1';"
+docker compose exec -T postgres psql -U app -d app \
+  -c "SELECT count(*) AS outbox_pending FROM account_outbox WHERE published = FALSE;"
+```
+
+Expected results: the repeated `command-id` returns the first stored
+response with no new version; `balance_view` shows `70.00` at version 2
+before and after `--full`; the event list has versions 1 and 2 with distinct
+`acct-1-v1` and `acct-1-v2` ids; relaying the outbox then projecting in the
+ledger consumer converges to the same `70.00`.
 
 ## Checkpoints
 
-??? question "1. Why is `UNIQUE (account_id, version)` the heart of the whole store?"
-    Because it is the **event store's exactly-once invariant**: the same
-    aggregate can never contain two events with the same version. Consequences:
-    - **Append-only integrity**: a retried append (crash between INSERT and
-      commit) hits the constraint → the store refuses a duplicate version —
-      history is *unique by construction*, no idempotent-writer needed.
-    - **Optimistic concurrency**: two concurrent withdrawals on one account
-      both read `version=5`; exactly one INSERT of `version=6` wins; the loser
-      gets `UniqueViolation` → fold the newest events and retry (P11 step 2).
-      The constraint *is* the CAS — the P3-style guard and the optimistic
-      concurrency guard are the same row.
-    - **Replay safety**: the view rebuild reads `(account_id, version)` as its
-      order key — total order per aggregate that can't be corrupted by clocks.
-    Without it you'd need a SELECT-check (racy), a distributed lock (complex),
-    or a repair process — the constraint gives all three for the price of one
-    index.
+??? question "Why is the constraint the concurrency control?"
+    Both writers race to insert the next version; the loser gets a conflict
+    and retries. A pre-check would have a check-to-insert race.
 
-??? question "2. Balance is 9,000,000 events deep. Replay takes 3 minutes. What three optimizations (snapshot, partial replay, view rebuild targets) restore it?"
-    1. **Periodic snapshots**: every N events (or every 24 h) write
-       `account_snapshot(account_id, version, balance)` — replay starts from the
-       newest snapshot ≤ target, folding only the tail. 9M events → maybe 5k.
-    2. **Partial / targeted replay**: replay only the *affected* aggregates
-       (the replay tool filters by `account_id`), and only rows with
-       `version > stored_version` in the view (the version column's purpose —
-       incremental fold).
-    3. **Rebuild targets by consumer need**: `balance_view` for reads
-       (snapshot-driven), `monthly_statements` rebuilt per-month from the log,
-       audit archive untouched — you don't rebuild *all* projections on every
-       bug; you rebuild the ones the bug touched, with snapshot baselines.
-    Note the tradeoff honestly: snapshots are themselves state to keep
-    consistent (write them from the same fold code, same `version`), but they
-    buy the "replay in seconds, not minutes" property.
-
-??? question "3. The ledger consumer and balance_view disagree by $5. Who's right, and which evidence does the event store give you?"
-    **The event store is the arbiter — the ledger (a consumer projection) is a
-    derived opinion.** Evidence to collect, in order:
-    1. **Fold from the log, independently**: replay `account_events` for the
-       account through a *fresh* projector (or the `replay.sh` path) — the
-       authoritative balance. Compare against both `balance_view` and the
-       ledger consumer's output.
-    2. **Offsets vs versions**: which events did the ledger consumer actually
-       apply? (Check its committed offsets against the topic's log end; a
-       lagging/errored consumer explains "missing event".)
-    3. **Duplicates/dedup**: `processed_events` tells you if a delivery was
-       skipped (dedup marker present but projection row updated → applied
-       twice?) — the constraint protects apply, not the projector's math.
-    Verdict rule: **a mismatch is always a projection bug (yours), never a
-    history bug** — until the fold itself disagrees with a *manual* accounting
-    of the facts, in which case the event (a fact) was wrong, and you have
-    exactly the corrupt-event policy question of break-it #4.
-
-??? question "4. Where would you *put* the event store outside Postgres? (Kafka topic with infinite retention; name the two tradeoffs — queryability, transactional coupling with outbox.)"
-    A Kafka topic (compact + infinite retention, key=`account_id`, value=event)
-    as the event log. The two tradeoffs to name:
-    1. **Queryability** — Kafka is a stream, not a database: you can replay in
-       order (single partition per key) but you can't do SQL: no
-       point-in-time balance queries, no `WHERE amount > x`, no ad-hoc
-       analysis without *projecting first*. Every read becomes a fold + index
-       (an analytics consumer) instead of a query.
-    2. **Transactional coupling with the outbox** — the "write event + produce"
-       atom has to span *two* stores: either the outbox (P4: DB txn → relay →
-       Kafka, event effectively *eventual*), or Kafka transactions (P10:
-       atomic within Kafka, but your command/read state then must live
-       Kafka-side too — a different coupling). You can't have "DB txn
-       commits + Kafka atomically" without one of the two bridges; both have
-       failure modes (lost relay, zombie epochs).
-    Bottom line: Postgres event store wins on queryability + single-txn
-    atomics; Kafka-as-event-log wins on distribution/scale-out but pays in
-    query power and bridge complexity. Real systems often do *both* — DB as the
-    authoritative store, topic as the transport — which is exactly P11 step 4's
-    design.
+??? question "What does replay prove?"
+    Full rebuild from `account_events` must equal the incremental view. If it
+    does not, the projector has a bug; the log stays authoritative.
 
 ## Done when
 
-- [ ] Ledger appended via events; nothing in the DB mutated state except the view
-- [ ] Concurrent writes resolved by optimistic retry, math checks out
-- [ ] `replay.sh` rebuilds balance_view and matches control values
-- [ ] You can explain "events = truth, projections = opinions" to a non-CS friend
+- [ ] Duplicate `command_id` appends nothing and returns the stored response
+- [ ] Concurrent writers resolve by version retry with correct `Decimal` math
+- [ ] Incremental and full projections agree at `70.00`
+- [ ] Ledger consumer converges once the outbox relay publishes
 
-## Learn more
-
-- **Read** — [Event Sourcing (Martin Fowler)](https://martinfowler.com/eaaDev/EventSourcing.html) — events as truth, snapshots as performance; the theory behind the bank.
-- **Watch** — [Turning the Database Inside Out (talk recording)](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Martin Kleppmann) — event-sourced systems and materialized views, the philosophical base of this project.
-- **Read** — [Designing Data-Intensive Applications](http://dataintensive.net), ch. 11 "Stream Processing" — replay, versioning and derived state, precisely.
-
-Next: **[P12 · Capstone: E-Commerce Platform](p12-capstone.md)** — every piece,
-one system.
+Next: **[P12 · Capstone: E-Commerce Platform](p12-capstone.md)**

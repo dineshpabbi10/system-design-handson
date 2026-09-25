@@ -76,9 +76,9 @@ shipping). By the end you will have designed and built:
 
 ## Prerequisites
 
-- Comfortable with Python (the runs-able code is FastAPI + `confluent-kafka`)
+- Comfortable with synchronous Python
 - Basic Docker / Docker Compose
-- Some SQL (a little PostgreSQL)
+- Basic SQL and PostgreSQL transactions
 - No Kafka experience required — the fundamentals section is self-contained
 
 ## Tech stack used throughout
@@ -86,9 +86,10 @@ shipping). By the end you will have designed and built:
 | Tool | Role |
 |------|------|
 | Kafka (KRaft mode) | The broker, topics, consumer groups |
-| FastAPI | HTTP service APIs |
+| FastAPI | HTTP service APIs with synchronous handlers |
 | confluent-kafka / librdkafka | Producer & consumer clients |
-| PostgreSQL | Service databases (orders, payments, outbox) |
+| PostgreSQL + psycopg 3 | Service databases and raw SQL access |
+| SQLAlchemy / SQLModel | Not used |
 | Debezium | Change Data Capture from the outbox table |
 | Confluent Schema Registry | Avro schemas + compatibility |
 | kcat / Console scripts | CLI inspection of topics |
@@ -96,10 +97,11 @@ shipping). By the end you will have designed and built:
 
 ## A note on the code
 
-Each project page shows **key snippets** inline (the parts that make the pattern work).
-Full runnable code lives in `code/pXX-*/` added project-by-project as you go — or in
-your own repo, which is even better for learning. Type things out yourself before
-peeking.
+Start with the complete shared stack and `common.py` in [Local Environment Setup](01-fundamentals/setup.md).
+Each project page then shows the complete files needed for its main pattern, plus
+exact commands to run and verify it. Database code uses psycopg 3 and raw
+PostgreSQL throughout; the projects intentionally contain no SQLAlchemy or SQLModel
+examples.
 
 !!! tip "The golden rule of this course"
     **Never trust a system you haven't broken.** Every project includes a
