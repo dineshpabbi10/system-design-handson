@@ -4,11 +4,20 @@ This is a bounded integration, not a new platform. You reuse the complete
 services from P4, P7, P8, and P9 unchanged, then add only tracing plus one
 analytics consumer. No new order, saga, or payment logic is defined here.
 
+### How the flow works (what runs where, and what the two new pieces prove)
+
+1. **P4 stays the order path.** `POST /orders` → `orders + orders_outbox` (one transaction, `order_id = uuid4()`, `event_id = order-{id}-placed`) → `relay.py` → `orders.events` → `inventory_worker.py` (claim → decrement → adjustment → commit). Ten posted orders must leave `0 pending` outbox rows — no loss lives here.
+2. **P7 stays the saga path.** `POST /checkout` (`saga_id + order_id`, `Idempotency-Key`) → `command_outbox` → `commands.*` → `services.py` → `saga.events` → orchestrator `TRANSITIONS` → compensation or `OrderConfirmed`. The watchdog (`watchdog_count`, republish same `event_id`) is the chaos drill: stop `events`, run `watchdog --once`, restart `events` — the saga advances with no duplicate effect.
+3. **P8 stays the poison path.** `reliability.py produce --failure-mode malformed` → `invalid` row in `dead_letters` + record on `orders.dead`; `produce --failure-mode permanent` → `replay --clear-failure` → exactly one `order_effects` row. Same IDs, same claim logic as P8 — the capstone only asserts the wiring still holds under one Compose stack.
+4. **P9 stays the contract.** `order-value.avsc` governs `orders.events`; the Avro producer/consumer are the serde reference. The capstone does not re-evolve the schema — it relies on the registry to keep every reused producer honest.
+5. **New piece 1: `analytics.py` is the convergence check.** Group `capstone-analytics` claims `(group, event_id)` from `orders.events` and bumps `analytics_counts(event_type, total)` with `INSERT … ON CONFLICT DO UPDATE total + 1`. Ten P4 orders must raise `OrderPlaced` by exactly 10 — duplicates would show here first.
+6. **New piece 2: `tracing.py` is ingress-only honesty.** `setup_tracing("capstone-orders", app)` instruments the P4 HTTP span and exports OTLP to Jaeger (`localhost:4318` → UI `:16686`). `inject/extract` helpers exist for header propagation, but the relay does not propagate context yet — the guaranteed span is the order-ingress POST, not a full pipeline waterfall. That limitation is stated so you do not mistake an instrumented edge for end-to-end tracing.
+
 ## Exactly what is reused
 
 | Prior file | Used unchanged for |
 |------------|-------------------|
-| `common.py` from Setup | `connect`, `new_producer`, `publish`, `jsonb` |
+| Explicit init pattern from Setup | `connect_db`, `new_producer`, `publish_event`, `Jsonb` (repeated in each file) |
 | `compose.yaml` from Setup | `kafka`, `postgres` base services |
 | P4 `api.py` | `POST /orders`, order plus outbox transaction |
 | P4 `relay.py` | outbox relay with `SKIP LOCKED`, ack then mark |
@@ -47,6 +56,7 @@ services:
 ```
 
 ```sql title="capstone_schema.sql"
+-- Analytics counter: one row per group + event type, bumped idempotently.
 CREATE TABLE IF NOT EXISTS analytics_counts (
   consumer_group TEXT NOT NULL,
   event_type TEXT NOT NULL,
@@ -77,37 +87,41 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-_configured = False
+_configured = False  # guard: set the global provider only once
 
 
 def setup_tracing(service_name: str, app: Any = None):
+    # Init OTel once, optionally instrument the FastAPI app for HTTP spans.
     global _configured
     if not _configured:
         provider = TracerProvider()
-        exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")
-        provider.add_span_processor(BatchSpanProcessor(exporter))
+        exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")  # Jaeger OTLP
+        provider.add_span_processor(BatchSpanProcessor(exporter))  # async batch export
         trace.set_tracer_provider(provider)
         _configured = True
     if app is not None:
-        FastAPIInstrumentor.instrument_app(app)
+        FastAPIInstrumentor.instrument_app(app)  # auto-span each HTTP request
     return trace.get_tracer(service_name)
 
 
 def inject_context(carrier: dict[str, str]) -> dict[str, str]:
+    # Write current trace ids into a dict for propagation (e.g. Kafka headers).
     inject(carrier)
     return carrier
 
 
 def extract_context(carrier: dict[str, str]) -> Any:
+    # Read trace ids back out on the receiving side.
     return extract(carrier)
 ```
 
 Save this alongside the reused P4 API and serve it instead of the untraced API:
 
 ```python title="traced_api.py"
-import tracing
-from api import app
+import tracing  # local OTel setup above
+from api import app  # P4 self-contained API with explicit DB + event helpers
 
+# Instrument HTTP spans; DB transaction in api.py is unchanged.
 tracing.setup_tracing("capstone-orders", app)
 ```
 
@@ -121,22 +135,35 @@ pipeline waterfall.
 ```python title="analytics.py"
 import json
 import os
+
+import psycopg
 from confluent_kafka import Consumer
-import common
+from psycopg.rows import dict_row
 
 TOPIC = "orders.events"
 GROUP = "capstone-analytics"
 
 
-def main() -> None:
-    consumer = Consumer(
+def connect_db():
+    # Postgres with dict rows for the claim + counter transaction.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer; offset follows the analytics transaction.
+    return Consumer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
-            "group.id": GROUP,
+            "group.id": group_id,
             "auto.offset.reset": "earliest",
             "enable.auto.offset.commit": False,
         }
     )
+
+
+def main() -> None:
+    # Counting consumer: claim event, bump per-type total, then commit offset.
+    consumer = new_consumer(GROUP)
     consumer.subscribe([TOPIC])
     try:
         while True:
@@ -145,18 +172,18 @@ def main() -> None:
                 continue
             if message.error() is not None:
                 raise RuntimeError(str(message.error()))
-            event = json.loads(message.value())
-            event_id = event["event_id"]
-            event_type = event["event_type"]
-            with common.connect() as connection:
-                with connection.transaction():
+            event = json.loads(message.value())  # envelope from P4 relay
+            event_id = event["event_id"]  # dedup key
+            event_type = event["event_type"]  # counting dimension
+            with connect_db() as connection:
+                with connection.transaction():  # claim + count = atomic
                     claimed = connection.execute(
                         "INSERT INTO processed_events (consumer_group, event_id) "
                         "VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) "
                         "DO NOTHING RETURNING event_id",
                         (GROUP, event_id),
                     ).fetchone()
-                    if claimed is not None:
+                    if claimed is not None:  # first delivery: increment
                         connection.execute(
                             "INSERT INTO analytics_counts (consumer_group, event_type, total) "
                             "VALUES (%s, %s, 1) "
@@ -164,7 +191,8 @@ def main() -> None:
                             "DO UPDATE SET total = analytics_counts.total + 1",
                             (GROUP, event_type),
                         )
-            consumer.commit(message=message, asynchronous=False)
+                    # Duplicate: claim lost race -> no double count.
+            consumer.commit(message=message, asynchronous=False)  # checkpoint
     finally:
         consumer.close()
 

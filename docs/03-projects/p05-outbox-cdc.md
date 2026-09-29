@@ -6,11 +6,23 @@ P5 keeps P4's business transaction and replaces only the publisher. PostgreSQL
 writes the outbox row in the same transaction as the order; Debezium reads the
 WAL and routes each insert to the existing `orders.events` topic.
 
-## Shared files and setup
+### How the flow works (P4 transaction, CDC publisher)
 
-Copy P4's complete `schema.sql`, `api.py`, `inventory_worker.py`, `common.py`, and
-outbox contract unchanged. Do not add a `published` update handler and do not
-change the event envelope. P4's `relay.py` is not part of the CDC path.
+1. **`api.py` is unchanged from P4.** `order_id = uuid4()`, `event_id = order-{id}-placed`, `aggregate_id = order_id`, one transaction writes `orders` + `orders_outbox`. You already know these IDs: order identity, stable event identity, Kafka key.
+2. **No relay poll.** Instead, Postgres streams the insert through its write-ahead log. Debezium's `PostgresConnector` (plugin `pgoutput`, `table.include.list = public.orders_outbox`) tails the WAL via replication slot `dbz_outbox` and publication `dbz_publication`.
+3. **The EventRouter SMT reshapes the CDC envelope.** The raw Debezium change event is a wrapper; `transforms.outbox.*` extracts `payload` → value, `aggregate_id` → Kafka key, `event_id` → dedup identity, and routes everything with `route.topic.replacement = orders.events`. What lands on `orders.events` is byte-identical to P4's envelope.
+4. **Why `published` stays `FALSE` and `skipped.operations = u,d`.** In P4 the relay flips `published` to true — that `UPDATE` would itself be a WAL event and, without the filter, would be republished as a duplicate. CDC ignores updates/deletes for exactly this reason; the flag is simply unused here.
+5. **`inventory_worker.py` is unchanged** — claim `(group, event_id)` → decrement stock → adjustment row → commit offset. That is why CDC replays (connector restart, `snapshot.mode = initial`) are harmless: same claim, same dedup.
+6. **What you operate instead of relay lag:** the replication slot (`pg_replication_slots`), `pg_stat_replication`, and Connect task state `RUNNING`. A stopped connector retains WAL (disk grows); deleting the connector does not drop the slot — you drop it deliberately.
+
+## Files and setup
+
+Copy P4's complete self-contained `schema.sql`, `api.py`, and
+`inventory_worker.py` unchanged — each already contains its own explicit
+Postgres connect, Producer, Consumer, and event-envelope helpers.
+Do not add a `published` update handler and do not
+change the event envelope. P4's `relay.py` is not part of the CDC path
+(it is used later only as a duplicate generator to prove dedup).
 
 This complete second file is an alternate stack for P5. It keeps the shared
 `INTERNAL` and `EXTERNAL` Kafka listeners, and gives the one-broker Connect
@@ -118,8 +130,9 @@ docker compose -f compose.connect.yaml exec -T postgres \
   psql -v ON_ERROR_STOP=1 -U app -d app < schema.sql
 ```
 
-The Connect container uses `kafka:29092`; host Python still uses the shared
-`KAFKA_BOOTSTRAP_SERVERS=localhost:9092` setting.
+The Connect container uses `kafka:29092`; host Python uses
+`KAFKA_BOOTSTRAP_SERVERS=localhost:9092` (set explicitly in each terminal,
+same as P4's self-contained `new_producer` / `new_consumer` helpers).
 
 ## Register the Debezium 3.x connector
 

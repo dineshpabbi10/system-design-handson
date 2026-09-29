@@ -21,15 +21,26 @@ checkout-start event. The explicit directions are `PaymentFailed` to
 `OrderCancelled`. This bounded demo injects failures before shipping, so it
 does not model cancelling an already dispatched shipment.
 
+### How the flow works
+
+1. **`POST /checkout` starts the saga.** The API mints `order_id = uuid4()` (the saga's correlation ID — every later event carries it as `aggregate_id` / Kafka key so all of one checkout lands on one partition, in order). It inserts `orders` (with lab flags `fail_payment / fail_stock`), a blank `order_pipeline` flag row, and an `OrderPlaced` outbox row — one transaction. `event_id = order-{id}-placed` is the stable start identity.
+2. **The relay fans the outbox to `saga.events`.** Same poll → publish → mark pattern as P4. From here there is no coordinator: each service watches the stream and reacts.
+3. **Payments and inventory race on `OrderPlaced`.** The `saga-payments` group claims it, locks the order, and either captures (`PaymentCaptured`, `payment_ok = 1`) or records `payment_failed = 1` + `PaymentFailed`. The `saga-inventory` group does the mirror: reserve (`StockReserved`, `stock_ok = 1`) or `StockFailed`. Order of arrival does not matter — each handler checks the other's flag (`stock_failed`, `payment_failed`) before deciding to emit success or immediately compensate.
+4. **Why `order_pipeline` is integer flags, not a status string.** A single `status` column forces an ordering on concurrent facts. Separate `payment_ok / stock_ok / payment_failed / stock_failed` columns let the two branches arrive in either order and still converge: shipping waits for `payment_ok = 1 AND stock_ok = 1 AND no failures`; compensation triggers on whichever failure lands first or second.
+5. **Compensation is just more events.** `PaymentFailed` makes inventory `release()` (return stock, `stock_released = 1`, `StockReleased`) and makes orders cancel. `StockFailed` makes payments `refund()` (`payment_refunded = 1`, `PaymentRefunded`) and makes orders cancel. Each compensation is idempotent (guarded by `refunded / released` flags) and itself buffered in the outbox, so crashing mid-compensation replays safely.
+6. **Shipping is the AND-gate.** The `saga-shipping` group records each fact (`payment_ok`, `stock_ok`, failures) and ships (`shipment_scheduled = 1`, `status = confirmed`, `OrderConfirmed`) only when both oks are set and no failure was ever seen. `processed_events` per group is what makes a redelivered `PaymentCaptured` not ship twice.
+
 ## Files and setup
 
-Copy shared `common.py` and `compose.yaml` unchanged. Create `schema.sql` and
-one clearly labeled educational `workflow.py` containing the API, relay, and
-all four handlers.
+No shared helper module — `workflow.py` below contains its own explicit
+Postgres connect, Producer, Consumer, and event-envelope helpers.
+Copy `compose.yaml` from [Setup](../01-fundamentals/setup.md).
+Create `schema.sql` and one clearly labeled educational `workflow.py`
+containing the API, relay, and all four handlers.
 
 ```text
 compose.yaml
-common.py
+requirements.txt
 schema.sql
 workflow.py
 ```
@@ -48,12 +59,14 @@ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.s
 ## Complete SQL schema
 
 ```sql title="schema.sql"
+-- Order header; fail_* flags inject deterministic failures for the lab.
 CREATE TABLE IF NOT EXISTS orders (
   order_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, sku TEXT NOT NULL,
   quantity INTEGER NOT NULL CHECK (quantity > 0), amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
   fail_payment BOOLEAN NOT NULL DEFAULT FALSE, fail_stock BOOLEAN NOT NULL DEFAULT FALSE,
   status TEXT NOT NULL DEFAULT 'new', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Correlation flags: each handler sets its fact; shipping waits for both ok.
 CREATE TABLE IF NOT EXISTS order_pipeline (
   order_id TEXT PRIMARY KEY REFERENCES orders(order_id),
   payment_ok INTEGER NOT NULL DEFAULT 0 CHECK (payment_ok IN (0,1)),
@@ -65,28 +78,35 @@ CREATE TABLE IF NOT EXISTS order_pipeline (
   shipment_scheduled INTEGER NOT NULL DEFAULT 0 CHECK (shipment_scheduled IN (0,1)),
   cancelled INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0,1))
 );
+-- Payment side effect; one row per order.
 CREATE TABLE IF NOT EXISTS payments (
   order_id TEXT PRIMARY KEY REFERENCES orders(order_id), amount NUMERIC(12,2) NOT NULL,
   captured BOOLEAN NOT NULL DEFAULT FALSE, refunded BOOLEAN NOT NULL DEFAULT FALSE
 );
+-- Stock level; CHECK prevents oversell in SQL.
 CREATE TABLE IF NOT EXISTS inventory (
   sku TEXT PRIMARY KEY, available INTEGER NOT NULL CHECK (available >= 0),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Reservation row; released flag makes release idempotent.
 CREATE TABLE IF NOT EXISTS reservations (
   order_id TEXT PRIMARY KEY REFERENCES orders(order_id), sku TEXT NOT NULL REFERENCES inventory(sku),
   quantity INTEGER NOT NULL CHECK (quantity > 0), released BOOLEAN NOT NULL DEFAULT FALSE
 );
+-- Local outbox: every handler buffers events here, relay publishes them.
 CREATE TABLE IF NOT EXISTS saga_outbox (
   id BIGSERIAL PRIMARY KEY, aggregate_id TEXT NOT NULL, event_type TEXT NOT NULL,
   event_id TEXT NOT NULL UNIQUE, payload JSONB NOT NULL,
   published BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Poll only pending rows.
 CREATE INDEX IF NOT EXISTS saga_outbox_pending_idx ON saga_outbox (published, id) WHERE published = FALSE;
+-- Consumer dedup per group + event.
 CREATE TABLE IF NOT EXISTS processed_events (
   consumer_group TEXT NOT NULL, event_id TEXT NOT NULL,
   claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (consumer_group, event_id)
 );
+-- Seed stock for the demo.
 INSERT INTO inventory (sku, available) VALUES ('sku-1', 100) ON CONFLICT (sku) DO NOTHING;
 ```
 
@@ -96,45 +116,114 @@ payment and stock facts may arrive in either order.
 
 ## Complete educational `workflow.py`
 
+Every init is explicit: `connect_db` opens Postgres, `new_producer` builds an
+idempotent producer, `consume` builds a manual-commit consumer per group,
+`publish_event` waits for the broker ack.
+
 ```python title="workflow.py"
 import argparse
 import json
 import os
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 from uuid import uuid4
-from confluent_kafka import Consumer
+
+import psycopg
+from confluent_kafka import Consumer, Producer
 from fastapi import FastAPI
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
-import common
 
 app = FastAPI()
 TOPIC = "saga.events"
 GROUPS = {"payment": "saga-payments", "inventory": "saga-inventory", "orders": "saga-orders", "shipping": "saga-shipping"}
+
+
+# --- Explicit init helpers (repeated in every project so you learn them) ---
+def connect_db():
+    # Postgres with dict rows; one connection per handler invocation.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def make_event(event_id, event_type, aggregate_type, aggregate_id, data):
+    # Canonical envelope; stable event_id makes retries dedup-safe.
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: acks=all + idempotence avoids broker dupes.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Keyed produce + flush; raises if broker rejects the write.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
 
 class CheckoutRequest(BaseModel):
     customer_id: str
     sku: str
     quantity: int = Field(gt=0)
     amount: Decimal = Field(gt=0)
-    fail_payment: bool = False
-    fail_stock: bool = False
+    fail_payment: bool = False  # lab flag: force payment branch to fail
+    fail_stock: bool = False  # lab flag: force inventory branch to fail
+
 
 def enqueue(connection: Any, event: dict[str, Any]) -> None:
+    # Buffer event in local outbox; relay publishes it later.
     connection.execute(
         "INSERT INTO saga_outbox (aggregate_id, event_type, event_id, payload) VALUES (%s, %s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
-        (event["aggregate_id"], event["event_type"], event["event_id"], common.jsonb(event)),
+        (event["aggregate_id"], event["event_type"], event["event_id"], Jsonb(event)),
     )
 
+
 def emit(connection: Any, event_id: str, event_type: str, order_id: str, data: dict[str, Any]) -> None:
-    enqueue(connection, common.make_event(event_id, event_type, "checkout", order_id, data))
+    # Convenience: build envelope then buffer it in the same DB transaction.
+    enqueue(connection, make_event(event_id, event_type, "checkout", order_id, data))
+
 
 @app.post("/checkout")
 def checkout(request: CheckoutRequest) -> dict[str, str | int]:
+    # Create order + pipeline row + OrderPlaced outbox row atomically.
     order_id = str(uuid4())
-    event_id = f"order-{order_id}-placed"
-    with common.connect() as connection:
+    event_id = f"order-{order_id}-placed"  # stable id for this checkout
+    with connect_db() as connection:
         with connection.transaction():
             connection.execute(
                 "INSERT INTO orders (order_id, customer_id, sku, quantity, amount, fail_payment, fail_stock) VALUES (%s, %s, %s, %s, %s, %s, %s)",
@@ -144,66 +233,79 @@ def checkout(request: CheckoutRequest) -> dict[str, str | int]:
             emit(connection, event_id, "OrderPlaced", order_id, {"order_id": order_id, "customer_id": request.customer_id, "sku": request.sku, "quantity": request.quantity, "amount": str(request.amount), "fail_payment": request.fail_payment, "fail_stock": request.fail_stock})
     return {"order_id": order_id, "status": "new"}
 
+
 def claim(connection: Any, group: str, event_id: str) -> bool:
+    # Dedup guard: first claim wins, replay loses the race and returns False.
     return connection.execute(
         "INSERT INTO processed_events (consumer_group, event_id) VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) DO NOTHING RETURNING event_id",
         (group, event_id),
     ).fetchone() is not None
 
+
 def refund(connection: Any, order_id: str) -> None:
+    # Compensate a captured payment; idempotent via refunded flag.
     row = connection.execute("SELECT amount, captured, refunded FROM payments WHERE order_id = %s FOR UPDATE", (order_id,)).fetchone()
     if row is None or not row["captured"] or row["refunded"]:
-        return
+        return  # nothing to refund
     connection.execute("UPDATE payments SET refunded = TRUE WHERE order_id = %s", (order_id,))
     connection.execute("UPDATE order_pipeline SET payment_refunded = 1 WHERE order_id = %s", (order_id,))
     emit(connection, f"payment-{order_id}-refunded", "PaymentRefunded", order_id, {"order_id": order_id, "amount": str(row["amount"])})
 
+
 def release(connection: Any, order_id: str) -> None:
+    # Compensate a reservation: return stock, mark released, emit event.
     row = connection.execute("SELECT sku, quantity, released FROM reservations WHERE order_id = %s FOR UPDATE", (order_id,)).fetchone()
     if row is None or row["released"]:
-        return
+        return  # nothing to release
     connection.execute("UPDATE inventory SET available = available + %s, updated_at = now() WHERE sku = %s", (row["quantity"], row["sku"]))
     connection.execute("UPDATE reservations SET released = TRUE WHERE order_id = %s", (order_id,))
     connection.execute("UPDATE order_pipeline SET stock_released = 1 WHERE order_id = %s", (order_id,))
     emit(connection, f"stock-{order_id}-released", "StockReleased", order_id, {"order_id": order_id, "sku": row["sku"], "quantity": row["quantity"]})
 
+
 def payment_handler(event: dict[str, Any]) -> None:
+    # Payment owner: reacts to OrderPlaced + late failure facts from inventory.
     event_type = event["event_type"]
     if event_type not in {"OrderPlaced", "PaymentFailed", "StockFailed"}:
-        return
+        return  # not our event; ignore
     order_id = event["aggregate_id"]
-    with common.connect() as connection:
-        with connection.transaction():
+    with connect_db() as connection:
+        with connection.transaction():  # claim + state + outbox = atomic
             if not claim(connection, GROUPS["payment"], event["event_id"]):
-                return
+                return  # duplicate delivery
             order = connection.execute("SELECT amount, fail_payment FROM orders WHERE order_id = %s FOR UPDATE", (order_id,)).fetchone()
             state = connection.execute("SELECT stock_failed FROM order_pipeline WHERE order_id = %s FOR UPDATE", (order_id,)).fetchone()
             if order is None or state is None:
                 raise RuntimeError(f"missing order {order_id}")
             if event_type == "OrderPlaced":
                 if order["fail_payment"]:
+                    # Injected failure: record fact, emit PaymentFailed.
                     connection.execute("UPDATE order_pipeline SET payment_failed = 1 WHERE order_id = %s", (order_id,))
                     emit(connection, f"payment-{order_id}-failed", "PaymentFailed", order_id, {"order_id": order_id, "reason": "injected-payment-failure"})
                 else:
+                    # Happy path: capture exactly once via ON CONFLICT.
                     connection.execute("INSERT INTO payments (order_id, amount, captured) VALUES (%s, %s, TRUE) ON CONFLICT (order_id) DO NOTHING", (order_id, order["amount"]))
                     connection.execute("UPDATE order_pipeline SET payment_ok = 1 WHERE order_id = %s", (order_id,))
                     if state["stock_failed"] == 1:
-                        refund(connection, order_id)
+                        refund(connection, order_id)  # stock already failed -> compensate
                     else:
                         emit(connection, f"payment-{order_id}-captured", "PaymentCaptured", order_id, {"order_id": order_id, "amount": str(order["amount"])})
             else:
+                # Late failure fact: record it, then refund if we captured.
                 if event_type == "PaymentFailed":
                     connection.execute("UPDATE order_pipeline SET payment_failed = 1 WHERE order_id = %s", (order_id,))
                 else:
                     connection.execute("UPDATE order_pipeline SET stock_failed = 1 WHERE order_id = %s", (order_id,))
                 refund(connection, order_id)
 
+
 def inventory_handler(event: dict[str, Any]) -> None:
+    # Inventory owner: mirrors payment logic for stock reservation.
     event_type = event["event_type"]
     if event_type not in {"OrderPlaced", "PaymentFailed", "StockFailed"}:
         return
     order_id = event["aggregate_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             if not claim(connection, GROUPS["inventory"], event["event_id"]):
                 return
@@ -214,6 +316,7 @@ def inventory_handler(event: dict[str, Any]) -> None:
             if event_type == "OrderPlaced":
                 updated = None
                 if not order["fail_stock"]:
+                    # Atomic decrement; None means out of stock (CHECK-safe).
                     updated = connection.execute("UPDATE inventory SET available = available - %s, updated_at = now() WHERE sku = %s AND available >= %s RETURNING sku", (order["quantity"], order["sku"], order["quantity"])).fetchone()
                 if updated is None:
                     connection.execute("UPDATE order_pipeline SET stock_failed = 1 WHERE order_id = %s", (order_id,))
@@ -222,7 +325,7 @@ def inventory_handler(event: dict[str, Any]) -> None:
                     connection.execute("INSERT INTO reservations (order_id, sku, quantity) VALUES (%s, %s, %s) ON CONFLICT (order_id) DO NOTHING", (order_id, order["sku"], order["quantity"]))
                     connection.execute("UPDATE order_pipeline SET stock_ok = 1 WHERE order_id = %s", (order_id,))
                     if state["payment_failed"] == 1:
-                        release(connection, order_id)
+                        release(connection, order_id)  # payment already failed
                     else:
                         emit(connection, f"stock-{order_id}-reserved", "StockReserved", order_id, {"order_id": order_id, "sku": order["sku"], "quantity": order["quantity"]})
             else:
@@ -232,28 +335,32 @@ def inventory_handler(event: dict[str, Any]) -> None:
                     connection.execute("UPDATE order_pipeline SET stock_failed = 1 WHERE order_id = %s", (order_id,))
                 release(connection, order_id)
 
+
 def orders_handler(event: dict[str, Any]) -> None:
+    # Orders owner: any failure cancels the order exactly once.
     if event["event_type"] not in {"PaymentFailed", "StockFailed"}:
         return
     order_id = event["aggregate_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             if not claim(connection, GROUPS["orders"], event["event_id"]):
                 return
             state = connection.execute("SELECT cancelled FROM order_pipeline WHERE order_id = %s FOR UPDATE", (order_id,)).fetchone()
             if state is None:
                 raise RuntimeError(f"missing order {order_id}")
-            if state["cancelled"] == 0:
+            if state["cancelled"] == 0:  # idempotent cancel guard
                 connection.execute("UPDATE order_pipeline SET cancelled = 1 WHERE order_id = %s", (order_id,))
                 connection.execute("UPDATE orders SET status = 'cancelled' WHERE order_id = %s", (order_id,))
                 emit(connection, f"order-{order_id}-cancelled", "OrderCancelled", order_id, {"order_id": order_id, "reason": event["event_type"]})
 
+
 def shipping_handler(event: dict[str, Any]) -> None:
+    # Shipping owner: ships only when both ok flags set and no failure seen.
     event_type = event["event_type"]
     if event_type not in {"PaymentCaptured", "StockReserved", "PaymentFailed", "StockFailed"}:
         return
     order_id = event["aggregate_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             if not claim(connection, GROUPS["shipping"], event["event_id"]):
                 return
@@ -267,13 +374,15 @@ def shipping_handler(event: dict[str, Any]) -> None:
                 connection.execute("UPDATE order_pipeline SET stock_failed = 1 WHERE order_id = %s", (order_id,))
             state = connection.execute("SELECT payment_ok, stock_ok, payment_failed, stock_failed, shipment_scheduled FROM order_pipeline WHERE order_id = %s FOR UPDATE", (order_id,)).fetchone()
             if state is None or state["payment_failed"] == 1 or state["stock_failed"] == 1:
-                return
+                return  # failure seen -> never ship
             if state["payment_ok"] == 1 and state["stock_ok"] == 1 and state["shipment_scheduled"] == 0:
                 connection.execute("UPDATE order_pipeline SET shipment_scheduled = 1 WHERE order_id = %s", (order_id,))
                 connection.execute("UPDATE orders SET status = 'confirmed' WHERE order_id = %s", (order_id,))
                 emit(connection, f"order-{order_id}-confirmed", "OrderConfirmed", order_id, {"order_id": order_id})
 
+
 def consume(group: str, handler: Callable[[dict[str, Any]], None]) -> None:
+    # Generic group loop: poll -> handle (DB tx inside) -> commit offset.
     consumer = Consumer({"bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"], "group.id": group, "auto.offset.reset": "earliest", "enable.auto.offset.commit": False})
     consumer.subscribe([TOPIC])
     try:
@@ -283,23 +392,27 @@ def consume(group: str, handler: Callable[[dict[str, Any]], None]) -> None:
                 continue
             if message.error() is not None:
                 raise RuntimeError(str(message.error()))
-            handler(json.loads(message.value()))
-            consumer.commit(message=message, asynchronous=False)
+            handler(json.loads(message.value()))  # handler owns its DB transaction
+            consumer.commit(message=message, asynchronous=False)  # checkpoint
     finally:
         consumer.close()
 
+
 def relay_once(connection: Any, producer: Any) -> int:
+    # Outbox relay: publish pending rows, mark only after ack.
     with connection.transaction():
         rows = connection.execute("SELECT id, payload FROM saga_outbox WHERE published = FALSE ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED").fetchall()
         for row in rows:
-            common.publish(producer, TOPIC, row["payload"])
+            publish_event(producer, TOPIC, row["payload"])
         if rows:
             connection.execute("UPDATE saga_outbox SET published = TRUE WHERE id = ANY(%s)", ([row["id"] for row in rows],))
     return len(rows)
 
+
 def relay(once: bool) -> None:
-    producer = common.new_producer("p06-saga-relay")
-    with common.connect() as connection:
+    # Polling relay process; --once used in tests, loop used in prod-like run.
+    producer = new_producer("p06-saga-relay")
+    with connect_db() as connection:
         while True:
             try:
                 count = relay_once(connection, producer)
@@ -312,6 +425,7 @@ def relay(once: bool) -> None:
                 if once:
                     return
                 time.sleep(0.1 if count == 0 else 0)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -330,7 +444,7 @@ if __name__ == "__main__":
 The four `consume` commands are independent groups even though they share a
 process. In production they are separate processes and databases. A crash
 after a local commit causes redelivery; the group-scoped claim makes the side
-effect once-only. The outbox relay publishes only after `common.publish`
+effect once-only. The outbox relay publishes only after `publish_event`
 acknowledges each row.
 
 ## Run and verify

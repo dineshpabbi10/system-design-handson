@@ -1,7 +1,8 @@
 # Local Environment Setup
 
-Every project uses the same stack and code shape. The project pages provide complete
-files for the pattern being taught; they do not depend on a hidden `code/` directory.
+Every project is self-contained. There is no shared `common.py` — each
+project page shows its full producer, consumer, and database setup so you
+learn the initialization by repetition.
 
 ## Stack contract
 
@@ -130,22 +131,20 @@ docker compose exec postgres psql -U app -d app -c 'SHOW wal_level;'
 not a highly available Kafka deployment: replication factor one has no failover
 replica.
 
-## 3. Shared project files
+## 3. Project layout (no shared code)
 
-Create this small tree inside the current project. Later pages either show a
-replacement file in full or tell you to copy the shared file unchanged.
+Create this small tree inside each project. Every file is complete on its own:
 
 ```text
 project-name/
-  compose.yaml
-  requirements.txt
-  common.py
-  schema.sql
-  producer.py
-  consumer.py
+  compose.yaml      # copy from section 2 above
+  requirements.txt  # copy from section 1 above
+  schema.sql        # shown in full on each project page that needs Postgres
+  producer.py       # shown in full, with its own Producer setup
+  consumer.py       # shown in full, with its own Consumer + DB setup
 ```
 
-The pages use these exact database and Kafka conventions:
+Conventions used in every project:
 
 - `psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)`
 - `%s` placeholders; never `$1`, `:name`, or interpolated values
@@ -155,24 +154,25 @@ The pages use these exact database and Kafka conventions:
 - `acks=all` and `enable.idempotence=true` for application producers
 - a delivery callback plus `flush()` before treating a produce as successful
 
-## 4. Shared `common.py`
+## 4. The init pattern every project repeats
 
-Copy this complete helper into each project that uses PostgreSQL or Kafka. Project
-files import these functions rather than inventing an async database wrapper.
+You will see these four blocks in every exercise, with concise comments.
+Learn them here once, then practice them in P1–P12.
 
-```python title="common.py"
-from datetime import datetime, timezone
+```python title="init-pattern.py"
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any
 
-from confluent_kafka import Producer
 import psycopg
+from confluent_kafka import Consumer, Producer
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 
-def connect() -> psycopg.Connection:
+def connect_db() -> psycopg.Connection:
+    # Open Postgres; dict_row makes each row behave like a dict.
     return psycopg.connect(
         os.environ["DATABASE_URL"],
         row_factory=dict_row,
@@ -186,52 +186,64 @@ def make_event(
     aggregate_id: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
+    # Build canonical envelope; caller must supply a stable event_id for dedup.
     return {
-        "event_id": event_id,
-        "event_type": event_type,
-        "aggregate_type": aggregate_type,
-        "aggregate_id": aggregate_id,
-        "schema_version": 1,
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
-        "data": data,
+        "event_id": event_id,  # dedup key, must survive retries
+        "event_type": event_type,  # e.g. OrderPlaced
+        "aggregate_type": aggregate_type,  # entity kind, e.g. order
+        "aggregate_id": aggregate_id,  # entity id; also the Kafka key
+        "schema_version": 1,  # bump when envelope shape changes
+        "occurred_at": datetime.now(timezone.utc).isoformat(),  # event time, UTC
+        "data": data,  # business payload
     }
 
 
 def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: acks=all + idempotence avoids broker-side dupes.
     return Producer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
-            "client.id": client_id,
-            "acks": "all",
-            "enable.idempotence": True,
-            "delivery.timeout.ms": 30000,
+            "client.id": client_id,  # visible in broker logs/metrics
+            "acks": "all",  # wait for all in-sync replicas
+            "enable.idempotence": True,  # broker dedups producer retries
+            "delivery.timeout.ms": 30000,  # bound how long produce waits
         }
     )
 
 
-def publish(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Produce one keyed record and wait for the broker ack.
     errors: list[str] = []
 
     def delivered(error: object, message: object) -> None:
+        # Delivery callback runs on flush; collects async broker errors.
         if error is not None:
             errors.append(str(error))
 
     producer.produce(
         topic,
-        key=str(event["aggregate_id"]).encode("utf-8"),
+        key=str(event["aggregate_id"]).encode("utf-8"),  # key -> partition routing
         value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-        callback=delivered,
+        callback=delivered,  # must check; produce() itself is async
     )
-    remaining = producer.flush(15.0)
+    remaining = producer.flush(15.0)  # block until ack or timeout
     if remaining != 0:
         raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
     if errors:
-        raise RuntimeError(errors[0])
-    producer.poll(0)
+        raise RuntimeError(errors[0])  # broker rejected the write
+    producer.poll(0)  # serve remaining callbacks
 
 
-def jsonb(value: Any) -> Jsonb:
-    return Jsonb(value)
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer; offset advances only after local processing.
+    return Consumer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "group.id": group_id,  # offset + rebalance scope
+            "auto.offset.reset": "earliest",  # start at beginning if no commit
+            "enable.auto.offset.commit": False,  # app commits after DB work
+        }
+    )
 ```
 
 `make_event` requires the caller to supply a stable `event_id`. A random event ID

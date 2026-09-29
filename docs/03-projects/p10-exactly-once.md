@@ -17,6 +17,16 @@ flowchart LR
     V --> O["observer.py"]
 ```
 
+### How the flow works
+
+There is no Postgres here — that absence is the point. The transaction is Kafka-only: outputs + offsets commit atomically.
+
+1. **`validator.py` batches the source.** Group `validators` consumes up to 50 records from `source` (`e-valid-1` with `amount > 0`, `e-bad-1` with `amount = -5`). `transactional.id = validator-1` is the fencing identity: one live owner per ID, enforced by broker epochs. `init_transactions()` fences any prior owner before the loop starts.
+2. **One transaction = outputs + offsets.** `begin_transaction()` → for each record, `produce` to `validated` (key and bytes preserved) or to `source.dead` with `x-error-type = permanent` (so no input offset is ever skipped without an output) → `send_offsets_to_transaction(next-offset per partition)` → `commit_transaction()`. Outputs and the group's resume position become visible together; a crash before commit leaves both invisible and the batch replays whole.
+3. **Why `observer.py` runs twice.** `read_committed` hides aborted batches; `read_uncommitted` can show pre-commit or aborted bytes. After a commit both converge — that convergence is what "exactly-once *in Kafka*" means, and why downstream consumers still need their own claim tables (the broker guarantee stops at the log).
+4. **`zombie.py` proves fencing.** `elder` begins a transaction, then `successor` calls `init_transactions()` with the same `transactional.id = validator-1` (epoch bump) and commits. The elder's commit now fails with a fencing error: only the current epoch can commit. That is how a restarted validator cannot double-commit its predecessor's batch.
+5. **`external_effect.py` proves the boundary.** `send_email_stub("ext-1")` appends to `/tmp/opencode-p10-side-effect.txt` *inside* the transaction window, then `abort_transaction()` rolls back the Kafka produce. The file still contains `email-sent ext-1` while `read_committed` never shows `ext-1`. Kafka aborts do not unsend emails — external effects need their own idempotency keys (back to P3).
+
 | Skill | Learned by |
 |-------|-----------|
 | Idempotent produce | `enable.idempotence=true`, `acks=all` |
@@ -59,6 +69,7 @@ GROUP = "validators"
 
 
 def validate(event: dict) -> bool:
+    # Pure check: envelope present, amount positive; invalid -> DLQ branch.
     if not isinstance(event, dict):
         return False
     if not event.get("event_id") or not event.get("aggregate_id"):
@@ -71,6 +82,7 @@ def validate(event: dict) -> bool:
 
 
 def main() -> None:
+    # Manual-commit consumer: offsets sent via transaction, not auto-commit.
     consumer = Consumer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
@@ -79,22 +91,23 @@ def main() -> None:
             "enable.auto.offset.commit": False,
         }
     )
+    # Transactional producer: id + init required before begin/commit.
     producer = Producer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
-            "transactional.id": "validator-1",
+            "transactional.id": "validator-1",  # fencing identity; one owner at a time
             "enable.idempotence": True,
             "acks": "all",
         }
     )
-    producer.init_transactions(10.0)
+    producer.init_transactions(10.0)  # fence old epochs, ready for transactions
     consumer.subscribe([SOURCE])
     try:
         while True:
-            messages = consumer.consume(num_messages=50, timeout=2.0)
+            messages = consumer.consume(num_messages=50, timeout=2.0)  # batch input
             if not messages:
                 continue
-            producer.begin_transaction()
+            producer.begin_transaction()  # start Kafka-only atomic unit
             try:
                 processed: list = []
                 for message in messages:
@@ -102,8 +115,10 @@ def main() -> None:
                         raise RuntimeError(str(message.error()))
                     event = json.loads(message.value())
                     if validate(event):
+                        # Valid: route to validated, preserve original key/bytes.
                         producer.produce(VALIDATED, key=message.key(), value=message.value())
                     else:
+                        # Invalid: route to DLQ in same tx so offset never skips.
                         producer.produce(
                             DEAD,
                             key=message.key(),
@@ -111,19 +126,19 @@ def main() -> None:
                             headers=[("x-error-type", b"permanent")],
                         )
                     processed.append(message)
-                producer.poll(0)
+                producer.poll(0)  # serve delivery callbacks before commit
                 offsets = [
                     TopicPartition(m.topic(), m.partition(), m.offset() + 1)
-                    for m in processed
+                    for m in processed  # next offset = consumed + 1
                 ]
                 producer.send_offsets_to_transaction(
-                    offsets, consumer.consumer_group_metadata()
+                    offsets, consumer.consumer_group_metadata()  # atomic: outputs + offsets
                 )
-                producer.commit_transaction()
+                producer.commit_transaction()  # outputs + offsets visible together
             except KafkaException as error:
                 print(f"transaction aborted: {error}")
                 try:
-                    producer.abort_transaction()
+                    producer.abort_transaction()  # aborted batch stays invisible
                 except KafkaException as abort_error:
                     print(f"abort failed: {abort_error}")
                 time.sleep(1)
@@ -157,6 +172,7 @@ TOPIC = "validated"
 
 
 def main() -> None:
+    # Compare isolation levels: same topic, different visibility of aborts.
     parser = argparse.ArgumentParser()
     parser.add_argument("--isolation", choices=["read_committed", "read_uncommitted"], required=True)
     parser.add_argument("--max-messages", type=int, default=100)
@@ -164,10 +180,10 @@ def main() -> None:
     consumer = Consumer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
-            "group.id": f"observer-{args.isolation}",
+            "group.id": f"observer-{args.isolation}",  # separate offset per mode
             "auto.offset.reset": "earliest",
-            "enable.auto.offset.commit": False,
-            "isolation.level": args.isolation,
+            "enable.auto.offset.commit": False,  # explicit commit after print
+            "isolation.level": args.isolation,  # the variable under test
         }
     )
     consumer.subscribe([TOPIC])
@@ -176,7 +192,7 @@ def main() -> None:
         while seen < args.max_messages:
             message = consumer.poll(1.0)
             if message is None:
-                break
+                break  # timeout with no data
             if message.error() is not None:
                 raise RuntimeError(str(message.error()))
             print(f"{args.isolation} p{message.partition()} o{message.offset()}")
@@ -211,6 +227,7 @@ BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
 
 def make_producer() -> Producer:
+    # Same transactional.id: second init fences the first (epoch bump).
     producer = Producer(
         {
             "bootstrap.servers": BOOTSTRAP,
@@ -219,7 +236,7 @@ def make_producer() -> Producer:
             "acks": "all",
         }
     )
-    producer.init_transactions(10.0)
+    producer.init_transactions(10.0)  # fencing happens here
     return producer
 
 
@@ -227,13 +244,13 @@ def main() -> None:
     elder = make_producer()
     elder.begin_transaction()
     elder.produce("validated", key=b"z-1", value=b'{"event_id":"z-1"}')
-    successor = make_producer()
+    successor = make_producer()  # fences elder on init
     successor.begin_transaction()
     successor.produce("validated", key=b"z-2", value=b'{"event_id":"z-2"}')
-    successor.commit_transaction()
+    successor.commit_transaction()  # current epoch wins
     print("successor committed; elder is now fenced")
     try:
-        elder.commit_transaction()
+        elder.commit_transaction()  # stale epoch must fail
         print("elder commit unexpectedly succeeded")
     except KafkaException as error:
         print(f"elder fenced as expected: {error}")
@@ -262,13 +279,14 @@ MARKER = "/tmp/opencode-p10-side-effect.txt"
 
 
 def send_email_stub(order_id: str) -> None:
+    # Non-transactional side effect: file append cannot be rolled back.
     with open(MARKER, "a", encoding="utf-8") as handle:
         handle.write(f"email-sent {order_id}\n")
 
 
 def main() -> None:
     if os.path.exists(MARKER):
-        os.remove(MARKER)
+        os.remove(MARKER)  # clean slate for the demo
     producer = Producer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
@@ -280,8 +298,8 @@ def main() -> None:
     producer.init_transactions(10.0)
     producer.begin_transaction()
     producer.produce("validated", key=b"ext-1", value=b'{"event_id":"ext-1"}')
-    send_email_stub("ext-1")
-    producer.abort_transaction()
+    send_email_stub("ext-1")  # happens outside Kafka tx
+    producer.abort_transaction()  # Kafka output rolled back, file is not
     with open(MARKER, encoding="utf-8") as handle:
         body = handle.read()
     print(f"aborted; marker file still contains: {body.strip()}")

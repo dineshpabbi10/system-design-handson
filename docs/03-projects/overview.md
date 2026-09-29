@@ -14,7 +14,9 @@ counts.
    interview questions later.
 5. Keep every service **boringly small** (one file, one concern). The patterns are
    the point, not the code.
-6. Copy the shared `common.py` from [Local Environment Setup](../01-fundamentals/setup.md).
+6. Every project is self-contained — no shared helper module.
+   Each page repeats its explicit Postgres connect, Producer, Consumer,
+   and event-envelope setup so you learn init by doing.
    A snippet is complete only when its imports, connection handling, event producer,
    and startup command are shown.
 

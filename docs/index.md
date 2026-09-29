@@ -97,8 +97,9 @@ shipping). By the end you will have designed and built:
 
 ## A note on the code
 
-Start with the complete shared stack and `common.py` in [Local Environment Setup](01-fundamentals/setup.md).
-Each project page then shows the complete files needed for its main pattern, plus
+Start with the stack and the explicit init pattern in [Local Environment Setup](01-fundamentals/setup.md).
+Each project page then shows complete self-contained files for its main pattern —
+every Producer, Consumer, and Postgres setup repeated inline — plus
 exact commands to run and verify it. Database code uses psycopg 3 and raw
 PostgreSQL throughout; the projects intentionally contain no SQLAlchemy or SQLModel
 examples.

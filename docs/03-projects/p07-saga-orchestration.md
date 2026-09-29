@@ -2,6 +2,19 @@
 **Read first:** [The Saga Pattern](../02-concepts/saga.md)
 The orchestrator commits state and its command-outbox row in one PostgreSQL transaction; a relay publishes the command.
 Step services below consume `commands.inventory`, `commands.payments`, and `commands.orders` and reply on `saga.events`.
+Both `orchestrator.py` and `services.py` below are self-contained — each shows
+its own explicit Postgres connect, Producer, Consumer, and event-envelope setup.
+
+### How the flow works
+
+Unlike P6 (every service watches everything), one brain — the orchestrator — issues commands and tracks the saga. Commands go out on `commands.*`; replies come back on `saga.events`.
+
+1. **Three IDs, three jobs.** `order_id = uuid4()` is the business entity (what the customer bought). `saga_id = uuid4()` is the workflow run — retrying the same HTTP intent must not spawn two runs, so the client's `Idempotency-Key` header maps 1:1 to one `saga_id` in `checkout_requests` (with `request_hash` rejecting same-key-different-body). `command event_id = {saga_id}:{Command}` (e.g. `abc:ReserveStock`) is stable per step, so the watchdog can republish the identical command without looking like a new instruction.
+2. **`POST /checkout` writes state + first command atomically.** One transaction inserts `checkout_requests` (the idempotency claim), `saga_instances(status = running, current_step = reserve_stock)`, and `command_outbox(ReserveStock → commands.inventory)`. No Kafka publish in the request path.
+3. **The relay delivers commands.** `SELECT … WHERE published = FALSE … FOR UPDATE SKIP LOCKED` → `produce` to the per-service topic → mark published. `COMMAND_TOPICS` is the routing table: `ReserveStock/ReleaseStock → commands.inventory`, `ChargePayment/RefundPayment → commands.payments`, `ConfirmOrder/CancelOrder → commands.orders`.
+4. **Step services are claim-then-apply.** Each (`saga-inventory-service`, `saga-payments-service`, `saga-orders-service`) claims `(group, command event_id)`, runs its local transaction (e.g. `UPDATE inventory_stock`, `INSERT INTO payment_ledger`, `INSERT INTO order_registry`), buffers a stable reply (`StockReserved`, `PaymentCaptured`, … with `aggregate_id = order_id`), publishes the reply to `saga.events`, and only then commits the command offset. A redelivered command loses the claim and re-emits nothing new.
+5. **The orchestrator folds replies through `TRANSITIONS`.** Group `saga-orchestrator` claims each reply, locks the saga row (`SELECT … FOR UPDATE`), and looks up `(current_step, event_type)`: `(reserve_stock, StockReserved) → (charge_payment, ChargePayment)`, `(charge_payment, PaymentCaptured) → (confirm, ConfirmOrder)`, `(confirm, OrderConfirmed) → done`. Failures (`StockFailed`, `PaymentFailed`, `OrderFailed`) call `begin_compensation()`: flip to `compensating`, set `stock_release_required / refund_required` from what actually completed, and enqueue `ReleaseStock + RefundPayment + CancelOrder`. While `compensating`, only `StockReleased / PaymentRefunded / OrderCancelled` advance the row; when every required compensation lands, status becomes `aborted`. A terminal (`succeeded / aborted`) saga ignores late events — no transition, no-op.
+6. **The watchdog heals silence.** If `updated_at < now() - 30s` and still `running`, it republishes the same command `event_id` (reset `published = FALSE`) and bumps `watchdog_count`; after 2 silent windows it compensates. Same ID means the republish is dedup-safe, not a duplicate charge.
 ## Topics and state
 Create these topics before starting the relay:
 ```bash
@@ -56,13 +69,72 @@ import hashlib
 import json
 import os
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 from uuid import uuid4
-from confluent_kafka import Consumer
+
+import psycopg
+from confluent_kafka import Consumer, Producer
 from fastapi import FastAPI, Header, HTTPException
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
-import common
+
+# --- Explicit init helpers (no shared module; repeated to teach init) ---
+def connect_db():
+    # Postgres with dict rows; one connection per request/handler.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def make_event(event_id, event_type, aggregate_type, aggregate_id, data):
+    # Canonical envelope; stable event_id makes command retries dedup-safe.
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: relay restarts can safely republish commands.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Keyed produce + flush; raises if broker rejects the write.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
 app = FastAPI()
 EVENT_TOPIC = "saga.events"
 GROUP = "saga-orchestrator"
@@ -104,7 +176,8 @@ def request_hash(request: CheckoutRequest) -> str:
     )
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 def command_event(saga: dict[str, Any], command: str) -> dict[str, Any]:
-    return common.make_event(
+    # Stable command id per saga+command: watchdog replays publish same id.
+    return make_event(
         event_id=f"{saga['saga_id']}:{command}",
         event_type=command,
         aggregate_type="saga",
@@ -125,7 +198,7 @@ def enqueue(connection: Any, saga: dict[str, Any], command: str) -> None:
             event["event_id"],
             command,
             COMMAND_TOPICS[command],
-            common.jsonb(event),
+            Jsonb(event),
         ),
     )
 def begin_compensation(connection: Any, saga: dict[str, Any]) -> None:
@@ -145,10 +218,11 @@ def begin_compensation(connection: Any, saga: dict[str, Any]) -> None:
         enqueue(connection, saga, "RefundPayment")
     enqueue(connection, saga, "CancelOrder")
 def apply_event(event: dict[str, Any]) -> None:
+    # Orchestrator step: claim event, lock saga row, advance TRANSITIONS table.
     event_id = event["event_id"]
     event_type = event["event_type"]
     order_id = event["aggregate_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             claimed = connection.execute(
                 """
@@ -267,7 +341,7 @@ def relay_once(connection: Any, producer: Any) -> int:
             """
         ).fetchall()
         for row in rows:
-            common.publish(producer, row["topic"], row["payload"])
+            publish_event(producer, row["topic"], row["payload"])
         if rows:
             connection.execute(
                 "UPDATE command_outbox SET published = TRUE WHERE command_id = ANY(%s)",
@@ -275,8 +349,8 @@ def relay_once(connection: Any, producer: Any) -> int:
             )
     return len(rows)
 def relay(once: bool) -> None:
-    producer = common.new_producer("p07-command-relay")
-    with common.connect() as connection:
+    producer = new_producer("p07-command-relay")
+    with connect_db() as connection:
         while True:
             try:
                 count = relay_once(connection, producer)
@@ -323,7 +397,7 @@ def watchdog_once(connection: Any) -> bool:
         )
         return True
 def watchdog(once: bool) -> None:
-    with common.connect() as connection:
+    with connect_db() as connection:
         while True:
             try:
                 changed = watchdog_once(connection)
@@ -353,7 +427,7 @@ def checkout(
         "amount": str(request.amount),
     }
     response = {"saga_id": saga_id, "order_id": order_id, "status": "running"}
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             claimed = connection.execute(
                 """
@@ -363,7 +437,7 @@ def checkout(
                 ON CONFLICT (idempotency_key) DO NOTHING
                 RETURNING idempotency_key
                 """,
-                (idempotency_key, body_hash, saga_id, common.jsonb(response)),
+                (idempotency_key, body_hash, saga_id, Jsonb(response)),
             ).fetchone()
             if claimed is None:
                 existing = connection.execute(
@@ -386,7 +460,7 @@ def checkout(
                         order_id,
                         idempotency_key,
                         body_hash,
-                        common.jsonb(payload),
+                        Jsonb(payload),
                     ),
                 )
                 enqueue(
@@ -417,16 +491,75 @@ Compensation events run only while `compensating`; `aborted` requires every requ
 import argparse
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any
-from confluent_kafka import Consumer
-import common
+
+import psycopg
+from confluent_kafka import Consumer, Producer
+from psycopg.rows import dict_row
+
+# --- Explicit init helpers (same pattern as orchestrator; no shared module) ---
+def connect_db():
+    # Postgres with dict rows for the claim + local update transaction.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def make_event(event_id, event_type, aggregate_type, aggregate_id, data):
+    # Canonical envelope; stable ids keep command/reply retries dedup-safe.
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer for reply events on saga.events.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Keyed produce + flush; raises on broker error before offset commit.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
 EVENT_TOPIC = "saga.events"
 TOPICS = {"inventory": "commands.inventory", "payments": "commands.payments", "orders": "commands.orders"}
 GROUPS = {"inventory": "saga-inventory-service", "payments": "saga-payments-service", "orders": "saga-orders-service"}
 def claim(connection: Any, group: str, event_id: str) -> bool:
     return connection.execute("INSERT INTO processed_events (consumer_group, event_id) VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) DO NOTHING RETURNING event_id", (group, event_id)).fetchone() is not None
 def emit(outbox: list, event_id: str, event_type: str, order_id: str, data: dict[str, Any]) -> None:
-    outbox.append(common.make_event(event_id, event_type, "saga", order_id, data))
+    # Buffer reply in memory; consume() publishes after local DB commit.
+    outbox.append(make_event(event_id, event_type, "saga", order_id, data))
 def inventory_handler(command: dict[str, Any], outbox: list) -> None:
     event_type = command["event_type"]
     if event_type not in {"ReserveStock", "ReleaseStock"}:
@@ -434,7 +567,7 @@ def inventory_handler(command: dict[str, Any], outbox: list) -> None:
     order_id = command["aggregate_id"]
     data = command["data"]
     saga_id = data["saga_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             if not claim(connection, GROUPS["inventory"], command["event_id"]):
                 return
@@ -455,7 +588,7 @@ def payments_handler(command: dict[str, Any], outbox: list) -> None:
     order_id = command["aggregate_id"]
     data = command["data"]
     saga_id = data["saga_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             if not claim(connection, GROUPS["payments"], command["event_id"]):
                 return
@@ -475,7 +608,7 @@ def orders_handler(command: dict[str, Any], outbox: list) -> None:
     order_id = command["aggregate_id"]
     data = command["data"]
     saga_id = data["saga_id"]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             if not claim(connection, GROUPS["orders"], command["event_id"]):
                 return
@@ -489,7 +622,7 @@ def orders_handler(command: dict[str, Any], outbox: list) -> None:
                 connection.execute("INSERT INTO order_registry (order_id, status) VALUES (%s, %s) ON CONFLICT (order_id) DO UPDATE SET status = %s", (order_id, "cancelled", "cancelled"))
                 emit(outbox, f"order-{order_id}-cancelled", "OrderCancelled", order_id, {"order_id": order_id, "saga_id": saga_id})
 def consume(service: str) -> None:
-    producer = common.new_producer(f"p07-{service}-service")
+    producer = new_producer(f"p07-{service}-service")
     consumer = Consumer({"bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"], "group.id": GROUPS[service], "auto.offset.reset": "earliest", "enable.auto.offset.commit": False})
     consumer.subscribe([TOPICS[service]])
     try:
@@ -502,7 +635,7 @@ def consume(service: str) -> None:
             outbox: list = []
             {"inventory": inventory_handler, "payments": payments_handler, "orders": orders_handler}[service](json.loads(message.value()), outbox)
             for event in outbox:
-                common.publish(producer, EVENT_TOPIC, event)
+                publish_event(producer, EVENT_TOPIC, event)
             consumer.commit(message=message, asynchronous=False)
     finally:
         consumer.close()

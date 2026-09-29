@@ -28,6 +28,15 @@ retry worker publishes due rows to `orders.events`. `orders.dead` holds
 forensics. The bounded budget is three retries after the first failure, then a
 DLQ handoff on the fourth failure.
 
+### How the flow works
+
+1. **`produce --failure-mode` injects the lesson.** `none` is the happy path; `transient` simulates a flaky dependency; `permanent` a business rejection; `malformed` sends truncated bytes `b'{"event_id":'`. `event_id` (e.g. `e-transient`) is caller-supplied and stable, so you can trace one poison pill through jobs → DLQ → replay. The Kafka key is preserved byte-for-byte on every hop so partition routing never changes.
+2. **`consume` classifies every record.** Group `orders-reliability` decodes the envelope: unparseable JSON or missing `event_id / aggregate_id / event_type` → `PermanentFailure` → `dead_letter()` immediately (no retry budget — poison never heals by waiting). `fail_mode = transient` or any unexpected exception → `TransientFailure` → `schedule_retry()`. Success → claim `(group, event_id)` + `INSERT INTO order_effects`. The source offset commits only after the downstream handoff (`publish_raw + flush`) acks — a crash before ack leaves both the DB row and the uncommitted offset for repair.
+3. **Why `retry_jobs` is the scheduler, not a Kafka timer.** `INSERT INTO retry_jobs (event_id, attempt, run_at = now() + BACKOFF[attempt], state = pending)` with `UNIQUE (event_id, attempt)` gives exactly one row per attempt. `BACKOFF_SECONDS = (1, 5, 15)` spaces attempts 1–3; attempt 4 (`MAX_ATTEMPTS = 4`) goes straight to DLQ as `exhausted`. `run_at` survives restarts (unlike an in-memory sleep), and the partial index `WHERE state = pending` keeps due-poll fast. The `orders.retry` record is just a wake-up/audit notification carrying `x-job-id / x-attempts / x-run-at`; the DB row is the truth.
+4. **Why `dead_letters` mirrors the DLQ topic.** `INSERT INTO dead_letters (source_topic, partition, offset, error_class)` with `UNIQUE(topic, partition, offset, error_class)` indexes the poison by its log position, storing raw bytes, headers, `error_detail`, and `attempts`. Only after the row commits does `publish_raw` send to `orders.dead` with `x-error-type / x-attempts / x-error-detail`, then `published_at` is marked. Crash between the two → the row exists but unmarked → repairable without the consumer offset.
+5. **`retry` republishes only when due.** `SELECT … WHERE state = pending AND notified_at IS NOT NULL AND run_at <= now() … FOR UPDATE SKIP LOCKED` → `publish_raw` back to `orders.events` with `x-retry-of` → mark `published`. A future `run_at` is never published early.
+6. **`replay` is the manual repair.** `SELECT … WHERE published_at IS NOT NULL AND replayed_at IS NULL` → optionally fix the payload (`--clear-failure` rewrites `fail_mode` to `none` — lab-only surgery) → republish to source → mark `replayed_at`. The worker's `processed_events` claim is what makes the second application a no-op if the effect already landed.
+
 ## Failure classes and headers
 
 Confluent headers are `(name, bytes)` pairs, not a string dictionary. This
@@ -48,23 +57,28 @@ Kafka acknowledgment leaves repairable work and an uncommitted source offset.
 ## Complete schema
 
 ```sql title="schema.sql"
+-- Consumer dedup: one claim per group + event.
 CREATE TABLE IF NOT EXISTS processed_events (
   consumer_group TEXT NOT NULL, event_id TEXT NOT NULL,
   claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (consumer_group, event_id)
 );
+-- Real side effect: one row per successfully processed event.
 CREATE TABLE IF NOT EXISTS order_effects (
   event_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, payload JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Durable scheduler: one row per attempt, run_at is the due time.
 CREATE TABLE IF NOT EXISTS retry_jobs (
   job_id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, source_topic TEXT NOT NULL,
   message_key TEXT, raw_value TEXT NOT NULL, headers JSONB NOT NULL,
   attempt INTEGER NOT NULL CHECK (attempt > 0), run_at TIMESTAMPTZ NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('pending', 'published')),
   notified_at TIMESTAMPTZ, published_at TIMESTAMPTZ, last_error TEXT NOT NULL,
-  UNIQUE (event_id, attempt)
+  UNIQUE (event_id, attempt)  -- same event retried once per attempt number
 );
+-- Fast poll for due jobs; partial index skips already-published rows.
 CREATE INDEX IF NOT EXISTS retry_jobs_due_idx ON retry_jobs (run_at, job_id) WHERE state = 'pending';
+-- Durable DLQ index: one row per poison source offset + error class.
 CREATE TABLE IF NOT EXISTS dead_letters (
   dead_id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, source_topic TEXT NOT NULL,
   source_partition INTEGER NOT NULL, source_offset BIGINT NOT NULL, message_key TEXT,
@@ -90,8 +104,77 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
+
+import psycopg
 from confluent_kafka import Consumer, Producer
-import common
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+# --- Explicit init helpers (no shared module; repeated to teach init) ---
+def connect_db():
+    # Postgres with dict rows; used for claims, jobs, and DLQ index.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def make_event(event_id, event_type, aggregate_type, aggregate_id, data):
+    # Canonical envelope; stable event_id keeps retries dedup-safe.
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer for retry wake-ups, DLQ records, and replays.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Keyed produce + flush; raises if broker rejects the write.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer; offset follows the retry/DLQ handoff.
+    return Consumer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "group.id": group_id,
+            "auto.offset.reset": "earliest",
+            "enable.auto.offset.commit": False,
+        }
+    )
+
 
 SOURCE_TOPIC = "orders.events"
 RETRY_TOPIC = "orders.retry"
@@ -101,37 +184,46 @@ MAX_ATTEMPTS = 4
 BACKOFF_SECONDS = (1, 5, 15)
 
 class TransientFailure(RuntimeError):
+    # Retryable: e.g. downstream timeout; budgeted then DLQ.
     pass
 
 class PermanentFailure(RuntimeError):
+    # Non-retryable: poison bytes or business rejection -> DLQ immediately.
     pass
 
 def header_text(message: Any, name: str, default: str | None = None) -> str | None:
+    # Read one Kafka header as text; headers are (name, bytes) pairs.
     for key, value in message.headers() or []:
         if key == name:
             return (value or b"").decode("utf-8", errors="replace")
     return default
 
 def headers_as_json(message: Any) -> list[list[str]]:
+    # Snapshot headers for durable storage in retry_jobs / dead_letters.
     return [[key, (value or b"").decode("utf-8", errors="replace")] for key, value in message.headers() or []]
 
 def replace_headers(headers: list[list[str]], additions: dict[str, str]) -> list[tuple[str, bytes]]:
+    # Merge headers: drop overwritten names, append new values as bytes.
     names = set(additions)
     result = [(key, value.encode("utf-8")) for key, value in headers if key not in names]
     result.extend((key, value.encode("utf-8")) for key, value in additions.items())
     return result
 
 def key_bytes(message: Any) -> bytes | None:
+    # Raw key for republishing; preserves partition routing.
     return message.key()
 
 def key_text(message: Any) -> str | None:
+    # Text key for DB storage; None stays None.
     key = message.key()
     return key.decode("utf-8", errors="replace") if key is not None else None
 
 def value_bytes(message: Any) -> bytes:
+    # Raw value; never None downstream.
     return message.value() or b""
 
 def publish_raw(producer: Producer, topic: str, key: bytes | None, value: bytes, headers: list[tuple[str, bytes]]) -> None:
+    # Low-level produce preserving original bytes + headers; flush = ack.
     errors: list[str] = []
     def delivered(error: object, message: object) -> None:
         if error is not None:
@@ -145,6 +237,7 @@ def publish_raw(producer: Producer, topic: str, key: bytes | None, value: bytes,
     producer.poll(0)
 
 def decode_event(message: Any) -> dict[str, Any]:
+    # Validate envelope; malformed bytes raise PermanentFailure (no retry).
     try:
         event = json.loads(value_bytes(message).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -157,7 +250,8 @@ def decode_event(message: Any) -> dict[str, Any]:
     return event
 
 def process_event(event: dict[str, Any]) -> None:
-    with common.connect() as connection:
+    # Claim event then write side effect; duplicate claim means safe skip.
+    with connect_db() as connection:
         with connection.transaction():
             claimed = connection.execute(
                 "INSERT INTO processed_events (consumer_group, event_id) VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) DO NOTHING RETURNING event_id",
@@ -175,10 +269,11 @@ def process_event(event: dict[str, Any]) -> None:
                 raise PermanentFailure("injected permanent failure")
             connection.execute(
                 "INSERT INTO order_effects (event_id, order_id, payload) VALUES (%s, %s, %s)",
-                (event["event_id"], event["aggregate_id"], common.jsonb(event)),
+                (event["event_id"], event["aggregate_id"], Jsonb(event)),
             )
 
 def schedule_retry(message: Any, event: dict[str, Any], error: Exception, producer: Producer) -> None:
+    # Durable backoff: insert job row first, then emit wake-up; budget exhausted -> DLQ.
     attempt = int(header_text(message, "x-attempts", "0") or 0) + 1
     if attempt >= MAX_ATTEMPTS:
         dead_letter(message, event, "exhausted", str(error), attempt, producer)
@@ -186,7 +281,7 @@ def schedule_retry(message: Any, event: dict[str, Any], error: Exception, produc
     run_at = datetime.now(timezone.utc) + timedelta(seconds=BACKOFF_SECONDS[attempt - 1])
     raw = value_bytes(message)
     headers = headers_as_json(message)
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             job = connection.execute(
                 """
@@ -195,24 +290,25 @@ def schedule_retry(message: Any, event: dict[str, Any], error: Exception, produc
                 ON CONFLICT (event_id, attempt) DO UPDATE SET last_error = EXCLUDED.last_error
                 RETURNING job_id, notified_at
                 """,
-                (event["event_id"], SOURCE_TOPIC, key_text(message), raw.decode("utf-8", errors="replace"), common.jsonb(headers), attempt, run_at, str(error)),
+                (event["event_id"], SOURCE_TOPIC, key_text(message), raw.decode("utf-8", errors="replace"), Jsonb(headers), attempt, run_at, str(error)),
             ).fetchone()
     if job["notified_at"] is not None:
         return
     wake_headers = replace_headers(headers, {"x-job-id": str(job["job_id"]), "x-attempts": str(attempt), "x-run-at": run_at.isoformat(), "x-error-class": "transient"})
     publish_raw(producer, RETRY_TOPIC, key_bytes(message), raw, wake_headers)
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             connection.execute("UPDATE retry_jobs SET notified_at = now() WHERE job_id = %s", (job["job_id"],))
 
 def dead_letter(message: Any, event: dict[str, Any] | None, error_class: str, detail: str, attempts: int, producer: Producer) -> None:
+    # Poison path: index in Postgres first, then publish to DLQ topic.
     raw = value_bytes(message)
     partition = message.partition()
     offset = message.offset()
     event_id = event["event_id"] if event is not None else f"invalid-{message.topic()}-{partition}-{offset}"
     headers = replace_headers(headers_as_json(message), {"x-error-type": error_class, "x-attempts": str(attempts), "x-error-detail": detail, "x-source-partition-offset": f"{partition}/{offset}"})
     stored_headers = [[name, value.decode("utf-8", errors="replace")] for name, value in headers]
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             row = connection.execute(
                 """
@@ -221,17 +317,18 @@ def dead_letter(message: Any, event: dict[str, Any] | None, error_class: str, de
                 ON CONFLICT (source_topic, source_partition, source_offset, error_class) DO UPDATE SET error_detail = EXCLUDED.error_detail
                 RETURNING dead_id, published_at
                 """,
-                (event_id, SOURCE_TOPIC, partition, offset, key_text(message), raw.decode("utf-8", errors="replace"), common.jsonb(event) if event is not None else None, common.jsonb(stored_headers), error_class, detail, attempts),
+                (event_id, SOURCE_TOPIC, partition, offset, key_text(message), raw.decode("utf-8", errors="replace"), Jsonb(event) if event is not None else None, Jsonb(stored_headers), error_class, detail, attempts),
             ).fetchone()
     if row["published_at"] is not None:
         return
     publish_raw(producer, DEAD_TOPIC, key_bytes(message), raw, headers)
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             connection.execute("UPDATE dead_letters SET published_at = now() WHERE dead_id = %s", (row["dead_id"],))
 
 def retry_once(producer: Producer) -> bool:
-    with common.connect() as connection:
+    # Scheduler tick: publish one due job back to source, mark published.
+    with connect_db() as connection:
         with connection.transaction():
             job = connection.execute(
                 "SELECT job_id, event_id, message_key, raw_value, headers, attempt FROM retry_jobs WHERE state = 'pending' AND notified_at IS NOT NULL AND run_at <= now() ORDER BY run_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED"
@@ -244,7 +341,8 @@ def retry_once(producer: Producer) -> bool:
             return True
 
 def retry_worker(once: bool) -> None:
-    producer = common.new_producer("p08-retry-worker")
+    # Poll scheduler: own idempotent producer, own DB connection per tick.
+    producer = new_producer("p08-retry-worker")
     while True:
         try:
             changed = retry_once(producer)
@@ -259,8 +357,9 @@ def retry_worker(once: bool) -> None:
             time.sleep(0.5 if not changed else 0)
 
 def consume() -> None:
-    producer = common.new_producer("p08-router")
-    consumer = Consumer({"bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"], "group.id": GROUP, "auto.offset.reset": "earliest", "enable.auto.offset.commit": False})
+    # Router loop: classify each record as ok / transient / permanent, then commit.
+    producer = new_producer("p08-router")
+    consumer = new_consumer(GROUP)  # explicit manual-commit consumer
     consumer.subscribe([SOURCE_TOPIC])
     try:
         while True:
@@ -284,17 +383,19 @@ def consume() -> None:
         consumer.close()
 
 def produce(failure_mode: str, event_id: str) -> None:
-    producer = common.new_producer("p08-producer")
-    event = common.make_event(event_id, "OrderReceived", "order", event_id, {"order_id": event_id, "fail_mode": failure_mode})
+    # Test injector: stable event_id; malformed mode sends truncated bytes.
+    producer = new_producer("p08-producer")
+    event = make_event(event_id, "OrderReceived", "order", event_id, {"order_id": event_id, "fail_mode": failure_mode})
     if failure_mode == "malformed":
         publish_raw(producer, SOURCE_TOPIC, event_id.encode("utf-8"), b'{"event_id":', [])
     else:
-        common.publish(producer, SOURCE_TOPIC, event)
+        publish_event(producer, SOURCE_TOPIC, event)
     print(event_id)
 
 def replay(event_id: str | None, clear_failure: bool) -> None:
-    producer = common.new_producer("p08-replay")
-    with common.connect() as connection:
+    # Manual repair: republish DLQ rows to source, mark replayed after ack.
+    producer = new_producer("p08-replay")
+    with connect_db() as connection:
         with connection.transaction():
             rows = connection.execute(
                 "SELECT dead_id, event_id, message_key, raw_value, headers FROM dead_letters WHERE published_at IS NOT NULL AND replayed_at IS NULL AND (%s::text IS NULL OR event_id = %s) ORDER BY dead_id LIMIT 100 FOR UPDATE SKIP LOCKED",

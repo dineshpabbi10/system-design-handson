@@ -17,14 +17,23 @@ flowchart LR
     W --> I[("inventory and adjustments")]
 ```
 
-## Shared files and setup
+### How the flow works
 
-Copy the shared `compose.yaml` and `common.py` unchanged from
-[Setup](../01-fundamentals/setup.md). Add these exact files:
+This is the fix for P3's commit-then-publish gap: the event is stored in the same transaction as the business row, so a crash can never leave an order with no event.
+
+1. **`POST /orders` carries `customer_id, sku, quantity, amount`.** The API mints `order_id = uuid4()` — the order's identity — and sets `aggregate_version = 1` (the first entry in that order's history; later transitions lock the row and bump it).
+2. **One transaction writes two rows.** `INSERT INTO orders` is the business fact; `INSERT INTO orders_outbox (aggregate_id, aggregate_version, event_id, payload)` is the durable copy of the event. `event_id = order-{order_id}-placed` is derived so a retried relay publishes the identical event. `aggregate_id = order_id` is the Kafka key and the per-order ordering scope. If the process dies before commit, neither row exists; after commit, the pending outbox row guarantees delivery.
+3. **Why `UNIQUE (aggregate_id, aggregate_version)` + `UNIQUE(event_id)`.** The first says "one event per order version" — version 2 cannot be inserted twice. The second makes relay retries dedup-safe. The partial index `WHERE published = FALSE` keeps the relay's poll fast as history grows.
+4. **`relay.py` polls, publishes, then marks.** `SELECT … WHERE published = FALSE ORDER BY aggregate_id, aggregate_version LIMIT 100 FOR UPDATE SKIP LOCKED` claims a batch (a second relay takes different rows, not the same ones). Each row is `produce + flush`; only after every ack does `UPDATE … SET published = TRUE` commit. Crash after ack but before mark → row stays pending → duplicate publish, which the worker absorbs.
+5. **`inventory_worker.py` turns the event into stock movement.** It claims `(inventory-workers, event_id)`, then `UPDATE inventory SET available = available - qty WHERE available >= qty` (the `CHECK (available >= 0)` plus the `>= qty` guard is what prevents oversell in SQL), then `INSERT INTO inventory_adjustments`. `inventory` is the current level; `inventory_adjustments` is the audit trail proving exactly one deduction per event. Offset commits only after that transaction.
+
+## Files and setup
+
+Every file below is self-contained — no shared helper module. Copy `compose.yaml`
+from [Setup](../01-fundamentals/setup.md). Add these exact files:
 
 ```text
 compose.yaml
-common.py
 requirements.txt
 schema.sql
 api.py
@@ -32,7 +41,7 @@ relay.py
 inventory_worker.py
 ```
 
-Start the shared stack, create the topic, and apply the schema:
+Start the stack, create the topic, and apply the schema:
 
 ```bash
 docker compose up -d --wait --wait-timeout 180
@@ -50,6 +59,7 @@ available.
 ## 1. `schema.sql`
 
 ```sql title="schema.sql"
+-- Business row: order header with optimistic version for later transitions.
 CREATE TABLE IF NOT EXISTS orders (
   order_id          TEXT PRIMARY KEY,
   customer_id       TEXT NOT NULL,
@@ -61,28 +71,32 @@ CREATE TABLE IF NOT EXISTS orders (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Outbox: durable copy of each event; relay publishes then marks published.
 CREATE TABLE IF NOT EXISTS orders_outbox (
   id                BIGSERIAL PRIMARY KEY,
-  aggregate_id      TEXT NOT NULL,
+  aggregate_id      TEXT NOT NULL,  -- Kafka key + ordering scope
   aggregate_version BIGINT NOT NULL CHECK (aggregate_version > 0),
   event_type        TEXT NOT NULL,
-  event_id          TEXT NOT NULL UNIQUE,
-  payload           JSONB NOT NULL,
+  event_id          TEXT NOT NULL UNIQUE,  -- dedup key for relay retries
+  payload           JSONB NOT NULL,  -- full event envelope
   published         BOOLEAN NOT NULL DEFAULT FALSE,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (aggregate_id, aggregate_version)
+  UNIQUE (aggregate_id, aggregate_version)  -- one event per order version
 );
 
+-- Fast poll for pending rows; partial index skips already-published rows.
 CREATE INDEX IF NOT EXISTS orders_outbox_pending_idx
   ON orders_outbox (published, aggregate_id, aggregate_version)
   WHERE published = FALSE;
 
+-- Stock level guarded by CHECK so oversell fails in SQL.
 CREATE TABLE IF NOT EXISTS inventory (
   sku        TEXT PRIMARY KEY,
   available  INTEGER NOT NULL CHECK (available >= 0),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Consumer dedup: one claim per group + event.
 CREATE TABLE IF NOT EXISTS processed_events (
   consumer_group TEXT NOT NULL,
   event_id       TEXT NOT NULL,
@@ -90,6 +104,7 @@ CREATE TABLE IF NOT EXISTS processed_events (
   PRIMARY KEY (consumer_group, event_id)
 );
 
+-- Real side effect: one adjustment per claimed event.
 CREATE TABLE IF NOT EXISTS inventory_adjustments (
   adjustment_id  BIGSERIAL PRIMARY KEY,
   consumer_group TEXT NOT NULL,
@@ -100,6 +115,7 @@ CREATE TABLE IF NOT EXISTS inventory_adjustments (
   UNIQUE (consumer_group, event_id)
 );
 
+-- Seed so the demo has stock without a separate setup step.
 INSERT INTO inventory (sku, available)
 VALUES ('sku-1', 100)
 ON CONFLICT (sku) DO NOTHING;
@@ -115,13 +131,17 @@ The event envelope is built before the transaction and inserted as JSONB beside
 the order. Nothing in this request publishes directly to Kafka.
 
 ```python title="api.py"
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
+import psycopg
 from fastapi import FastAPI
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
-
-import common
 
 app = FastAPI()
 
@@ -133,15 +153,34 @@ class CreateOrderRequest(BaseModel):
     amount: Decimal = Field(gt=0)
 
 
+def connect_db():
+    # Postgres with dict rows; one connection per request.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def make_event(event_id, event_type, aggregate_type, aggregate_id, data):
+    # Canonical envelope; event_id must be stable for relay retries.
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
 @app.post("/orders")
 def create_order(request: CreateOrderRequest) -> dict[str, str | int]:
-    order_id = str(uuid4())
-    aggregate_version = 1
-    event = common.make_event(
-        event_id=f"order-{order_id}-placed",
+    # Atomic dual-write: order row + outbox row commit together.
+    order_id = str(uuid4())  # new business id per request
+    aggregate_version = 1  # first version; later transitions increment under lock
+    event = make_event(
+        event_id=f"order-{order_id}-placed",  # stable id derived from order_id
         event_type="OrderPlaced",
         aggregate_type="order",
-        aggregate_id=order_id,
+        aggregate_id=order_id,  # Kafka key + outbox ordering scope
         data={
             "order_id": order_id,
             "customer_id": request.customer_id,
@@ -151,8 +190,8 @@ def create_order(request: CreateOrderRequest) -> dict[str, str | int]:
             "aggregate_version": aggregate_version,
         },
     )
-    with common.connect() as connection:
-        with connection.transaction():
+    with connect_db() as connection:
+        with connection.transaction():  # both inserts succeed or both roll back
             connection.execute(
                 """
                 INSERT INTO orders
@@ -179,9 +218,10 @@ def create_order(request: CreateOrderRequest) -> dict[str, str | int]:
                     aggregate_version,
                     event["event_type"],
                     event["event_id"],
-                    common.jsonb(event),
+                    Jsonb(event),  # store full envelope for the relay
                 ),
             )
+    # No Kafka publish here: relay will find the pending outbox row.
     return {"order_id": order_id, "aggregate_version": aggregate_version}
 ```
 
@@ -198,20 +238,39 @@ python -m uvicorn api:app --host 127.0.0.1 --port 8000
 python relay.py
 ```
 
-The relay uses the shared producer settings, but keeps the delivery callback and
-`flush()` visible because the mark must follow an acknowledged produce.
-
 ```python title="relay.py"
 import json
+import os
 import time
 from typing import Any
 
-import common
+import psycopg
+from confluent_kafka import Producer
+from psycopg.rows import dict_row
 
 TOPIC = "orders.events"
 
 
-def publish_row(producer: Any, row: dict[str, Any]) -> None:
+def connect_db():
+    # Long-lived connection for the polling loop below.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: relay restarts can safely republish pending rows.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_row(producer: Producer, row: dict[str, Any]) -> None:
+    # Publish one stored outbox row; flush proves broker ack before marking.
     errors: list[str] = []
 
     def delivered(error: object, message: object) -> None:
@@ -220,7 +279,7 @@ def publish_row(producer: Any, row: dict[str, Any]) -> None:
 
     producer.produce(
         TOPIC,
-        key=str(row["aggregate_id"]).encode("utf-8"),
+        key=str(row["aggregate_id"]).encode("utf-8"),  # preserve per-order order
         value=json.dumps(
             row["payload"], sort_keys=True, separators=(",", ":")
         ).encode("utf-8"),
@@ -228,14 +287,16 @@ def publish_row(producer: Any, row: dict[str, Any]) -> None:
     )
     remaining = producer.flush(15.0)
     if remaining != 0:
-        raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
+        raise TimeoutError(f"{remaining} record(s) undelivered")
     if errors:
         raise RuntimeError(errors[0])
     producer.poll(0)
 
 
 def relay_once(connection: Any, producer: Any) -> int:
+    # One poll batch: claim pending rows, publish each, then mark published.
     with connection.transaction():
+        # SKIP LOCKED lets a second relay take different rows, not the same ones.
         rows = connection.execute(
             """
             SELECT id, aggregate_id, aggregate_version, payload
@@ -247,8 +308,9 @@ def relay_once(connection: Any, producer: Any) -> int:
             """
         ).fetchall()
         for row in rows:
-            publish_row(producer, row)
+            publish_row(producer, row)  # raises on failure -> nothing marked
         if rows:
+            # Mark only after every ack: crash before commit means safe replay.
             connection.execute(
                 "UPDATE orders_outbox SET published = TRUE WHERE id = ANY(%s)",
                 ([row["id"] for row in rows],),
@@ -257,17 +319,17 @@ def relay_once(connection: Any, producer: Any) -> int:
 
 
 def main() -> None:
-    producer = common.new_producer("p04-outbox-relay")
-    with common.connect() as connection:
+    producer = new_producer("p04-outbox-relay")
+    with connect_db() as connection:
         while True:
             try:
                 count = relay_once(connection, producer)
             except Exception as error:
-                print(f"relay failed: {error}")
+                print(f"relay failed: {error}")  # batch stays pending, retried
                 time.sleep(1)
             else:
                 if count == 0:
-                    time.sleep(0.1)
+                    time.sleep(0.1)  # idle poll interval
 
 
 if __name__ == "__main__":
@@ -303,24 +365,35 @@ in one database transaction. The Kafka commit follows that transaction.
 
 ```python title="inventory_worker.py"
 import json
+import os
 
+import psycopg
 from confluent_kafka import Consumer
-
-import common
+from psycopg.rows import dict_row
 
 TOPIC = "orders.events"
 GROUP = "inventory-workers"
 
 
-def main() -> None:
-    consumer = Consumer(
+def connect_db():
+    # Per-message connection for the claim + stock update transaction.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer: offset follows the inventory transaction.
+    return Consumer(
         {
-            "bootstrap.servers": "localhost:9092",
-            "group.id": GROUP,
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "group.id": group_id,
             "auto.offset.reset": "earliest",
             "enable.auto.offset.commit": False,
         }
     )
+
+
+def main() -> None:
+    consumer = new_consumer(GROUP)
     consumer.subscribe([TOPIC])
     try:
         while True:
@@ -330,13 +403,13 @@ def main() -> None:
             error = message.error()
             if error is not None:
                 raise RuntimeError(str(error))
-            event = json.loads(message.value())
-            if event["event_type"] != "OrderPlaced":
+            event = json.loads(message.value())  # outbox envelope from relay
+            if event["event_type"] != "OrderPlaced":  # guard: only handle known type
                 raise ValueError(f"unexpected event type: {event['event_type']}")
-            event_id = event["event_id"]
-            data = event["data"]
-            with common.connect() as connection:
-                with connection.transaction():
+            event_id = event["event_id"]  # dedup key
+            data = event["data"]  # sku, quantity live here
+            with connect_db() as connection:
+                with connection.transaction():  # claim + stock + log = atomic
                     claimed = connection.execute(
                         """
                         INSERT INTO processed_events (consumer_group, event_id)
@@ -346,7 +419,7 @@ def main() -> None:
                         """,
                         (GROUP, event_id),
                     ).fetchone()
-                    if claimed is not None:
+                    if claimed is not None:  # first delivery: apply side effect
                         updated = connection.execute(
                             """
                             UPDATE inventory
@@ -366,7 +439,8 @@ def main() -> None:
                             """,
                             (GROUP, event_id, data["sku"], -data["quantity"]),
                         )
-            consumer.commit(message=message, asynchronous=False)
+                    # Duplicate: claim lost race -> no second stock move.
+            consumer.commit(message=message, asynchronous=False)  # checkpoint
     finally:
         consumer.close()
 

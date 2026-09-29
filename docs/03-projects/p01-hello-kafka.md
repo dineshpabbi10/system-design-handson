@@ -15,20 +15,27 @@ flowchart LR
     K --> C["consumer.py"]
 ```
 
-## Shared files and setup
+### How the flow works
 
-Copy the shared `compose.yaml` and `common.py` unchanged from
-[Setup](../01-fundamentals/setup.md). The project files are:
+1. `producer.py` loops 20 times. Each iteration picks `order_id = ord-000 … ord-019` — a fake business key so you can see key → partition routing.
+2. It builds an event with `event_id = order-{order_id}-placed`. The `event_id` is stable (derived from the order, not random) so a retry would carry the same identity. `aggregate_id = order_id` doubles as the Kafka record key.
+3. `publish()` sends with `key=aggregate_id`, then `flush()` blocks until the broker acks and assigns partition + offset. That ack is the only proof the write landed.
+4. `consumer.py` joins group `orders-console-group`, subscribes to `orders`, then `poll → print → commit`. The print is the stand-in for real work; the sync commit after it is the restart checkpoint.
+5. Kill and restart the consumer: it resumes from the last committed offset, not from zero. Records after that commit replay — that replay is at-least-once in miniature.
+
+## Files and setup
+
+Every file below is complete and self-contained — no shared helper module.
+Copy `compose.yaml` from [Setup](../01-fundamentals/setup.md). The project files are:
 
 ```text
 compose.yaml
 requirements.txt
-common.py
 producer.py
 consumer.py
 ```
 
-Start the shared stack and create the topic explicitly:
+Start the stack and create the topic explicitly:
 
 ```bash
 docker compose up -d --wait --wait-timeout 180
@@ -42,8 +49,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:29092 --describe --topic orders
 ```
 
-The producer uses the shared envelope, stable event ID, keyed delivery callback,
-and `flush()` in `common.publish`. Start it from this project root:
+Start the producer from this project root:
 
 ```bash
 python producer.py
@@ -52,23 +58,79 @@ python producer.py
 ## 1. `producer.py`
 
 ```python title="producer.py"
-import common
+import json
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+from confluent_kafka import Producer
+
+
+def make_event(event_id, event_type, aggregate_type, aggregate_id, data):
+    # Build canonical envelope; stable event_id enables later dedup.
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "schema_version": 1,  # envelope version, not business version
+        "occurred_at": datetime.now(timezone.utc).isoformat(),  # UTC event time
+        "data": data,
+    }
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: broker dedups retries, acks=all waits for replicas.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Produce one keyed record and block until the broker acknowledges it.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        # Async delivery report; collect errors to raise after flush.
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),  # key controls partition
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)  # wait for ack; produce() alone is async
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)  # serve leftover callbacks
+
 
 TOPIC = "orders"
 
 
 def main() -> None:
-    producer = common.new_producer("p01-order-producer")
+    # One producer process emits 20 keyed OrderPlaced events.
+    producer = new_producer("p01-order-producer")
     for number in range(20):
         order_id = f"ord-{number:03d}"
-        event = common.make_event(
-            event_id=f"order-{order_id}-placed",
+        event = make_event(
+            event_id=f"order-{order_id}-placed",  # stable id: retry-safe
             event_type="OrderPlaced",
             aggregate_type="order",
-            aggregate_id=order_id,
+            aggregate_id=order_id,  # Kafka key: same order -> same partition
             data={"order_id": order_id, "amount": 100 + number},
         )
-        common.publish(producer, TOPIC, event)
+        publish(producer, TOPIC, event)
 
 
 if __name__ == "__main__":
@@ -84,39 +146,47 @@ raises instead of being silently ignored.
 Start it with `python consumer.py` in another terminal. Run this:
 
 ```python title="consumer.py"
+import os
+
 from confluent_kafka import Consumer
 
 TOPIC = "orders"
 GROUP = "orders-console-group"
 
 
-def main() -> None:
-    consumer = Consumer(
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer: offset moves only after local processing.
+    return Consumer(
         {
-            "bootstrap.servers": "localhost:9092",
-            "group.id": GROUP,
-            "auto.offset.reset": "earliest",
-            "enable.auto.offset.commit": False,
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "group.id": group_id,  # offset + rebalance scope
+            "auto.offset.reset": "earliest",  # no commit yet -> read from start
+            "enable.auto.offset.commit": False,  # app commits explicitly below
         }
     )
-    consumer.subscribe([TOPIC])
+
+
+def main() -> None:
+    consumer = new_consumer(GROUP)
+    consumer.subscribe([TOPIC])  # join group, get partition assignment
     try:
         while True:
-            message = consumer.poll(1.0)
+            message = consumer.poll(1.0)  # heartbeat + fetch; None on timeout
             if message is None:
                 continue
             error = message.error()
             if error is not None:
-                raise RuntimeError(str(error))
+                raise RuntimeError(str(error))  # broker-level failure
             key = (message.key() or b"").decode("utf-8")
             value = (message.value() or b"").decode("utf-8")
+            # Local processing step: print. Commit only after it succeeds.
             print(
                 f"p{message.partition()} o{message.offset()} "
                 f"key={key} value={value}"
             )
-            consumer.commit(message=message, asynchronous=False)
+            consumer.commit(message=message, asynchronous=False)  # sync checkpoint
     finally:
-        consumer.close()
+        consumer.close()  # leave group cleanly, revoke partitions
 
 
 if __name__ == "__main__":

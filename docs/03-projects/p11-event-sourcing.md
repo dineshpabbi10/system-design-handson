@@ -17,6 +17,16 @@ flowchart LR
     K --> L["ledger_consumer.py"]
 ```
 
+### How the flow works
+
+The log is the truth; every balance is a fold over it. Three IDs keep the three concerns separate.
+
+1. **`command_id` is the caller's retry identity.** `cmd-acct-1-deposit-1` comes from the caller and is stable across retries. `INSERT INTO processed_commands … ON CONFLICT DO NOTHING` claims it: the first attempt executes, a retried `command_id` returns the stored `response` with no new event. This is P3's idempotency key, renamed for commands.
+2. **`event_version` is the account's sequence.** `next_version = MAX(version) + 1` proposes version N, then `INSERT INTO account_events (account_id, event_version, …)` with `UNIQUE (account_id, event_version)` decides the race. Two concurrent deposits both propose v3; one wins, the loser gets `UniqueViolation` and retries as v4. No `SELECT`-then-trust — the constraint is the concurrency control.
+3. **Why `event_id = {account_id}-v{version}`.** It is derived from the winner's version, so a version retry gets a new deterministic identity (`acct-1-v2`, not a reused UUID) while a command retry reuses nothing new at all. `aggregate_id = account_id` is the Kafka key (one account → one partition) and the fold scope.
+4. **One transaction writes three things.** Claim command + append event + `INSERT INTO account_outbox` commit together. `Decimal` math is strict: deposits add `abs(delta)`, withdrawals subtract it; amounts must be positive and the sign comes from the command type, never from a client-supplied negative.
+5. **Two projections, same fold.** `projector.py --account acct-1` folds `account_events` into `balance_view` (incremental: from stored version; `--full` deletes and refolds everything — both must agree at `70.00`). `relay.py` publishes the outbox to the `account_events` topic and `ledger_consumer.py` (group `ledger-projector`) folds the same events into `ledger_projection(balance_after)` with its own `(group, event_id)` claim. `balance_view` is the query cache; `ledger_projection` proves the Kafka path converges; `account_events` stays authoritative when they disagree.
+
 | Skill | Learned by |
 |-------|-----------|
 | Versioned event store | `UNIQUE (account_id, event_version)` |
@@ -41,12 +51,18 @@ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U app -d app < schema.s
 ## 1. `schema.sql`
 
 ```sql title="schema.sql"
+-- Event store: append-only log; version guard is the optimistic lock.
 CREATE TABLE IF NOT EXISTS account_events (id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, event_version INTEGER NOT NULL CHECK (event_version > 0), event_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL CHECK (event_type IN ('AccountOpened', 'Deposited', 'Withdrawn')), payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (account_id, event_version));
+-- Cached projection: rebuilt by folding the log; version tracks progress.
 CREATE TABLE IF NOT EXISTS balance_view (account_id TEXT PRIMARY KEY, balance NUMERIC(12,2) NOT NULL, event_version INTEGER NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+-- Command dedup: stable command_id -> stored response for replays.
 CREATE TABLE IF NOT EXISTS processed_commands (command_id TEXT PRIMARY KEY, response JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+-- Outbox for Kafka publishing; relay marks published after ack.
 CREATE TABLE IF NOT EXISTS account_outbox (id BIGSERIAL PRIMARY KEY, aggregate_id TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, payload JSONB NOT NULL, published BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS account_outbox_pending_idx ON account_outbox (published, id) WHERE published = FALSE;
+-- Consumer dedup for the Kafka projection below.
 CREATE TABLE IF NOT EXISTS processed_events (consumer_group TEXT NOT NULL, event_id TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (consumer_group, event_id));
+-- Kafka-side fold: running balance per version.
 CREATE TABLE IF NOT EXISTS ledger_projection (account_id TEXT NOT NULL, event_version INTEGER NOT NULL, event_id TEXT NOT NULL, delta NUMERIC(12,2) NOT NULL, balance_after NUMERIC(12,2) NOT NULL, PRIMARY KEY (account_id, event_version));
 ```
 
@@ -58,15 +74,64 @@ deterministic event id without reusing the caller's key.
 
 ```python title="bank.py"
 import argparse
+import json
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+
+import psycopg
 import psycopg.errors
-import common
+from confluent_kafka import Producer
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 GROUP = "bank-api"
 
 
+# --- Explicit init helpers (no shared module; repeated to teach init) ---
+def connect_db():
+    # Postgres with dict rows; one connection per command attempt.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer used by the relay below.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Keyed produce + flush; raises if broker rejects the write.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
 def next_version(connection: Any, account_id: str) -> int:
+    # Read max version; UNIQUE guard below decides the race, not this read.
     row = connection.execute(
         "SELECT COALESCE(MAX(event_version), 0) AS max_version "
         "FROM account_events WHERE account_id = %s",
@@ -76,19 +141,20 @@ def next_version(connection: Any, account_id: str) -> int:
 
 
 def apply_command(account_id: str, command_type: str, amount: Decimal, command_id: str) -> dict[str, Any]:
+    # Idempotent append: claim command, compute version, insert event + outbox.
     if command_type not in ("Deposited", "Withdrawn"):
         raise ValueError(f"unknown command {command_type}")
     if amount <= Decimal("0"):
         raise ValueError("amount must be positive")
-    for attempt in range(5):
+    for attempt in range(5):  # optimistic retry loop on version conflict
         try:
-            with common.connect() as connection:
+            with connect_db() as connection:
                 with connection.transaction():
                     claimed = connection.execute(
                         "INSERT INTO processed_commands (command_id, response) "
                         "VALUES (%s, %s) ON CONFLICT (command_id) DO NOTHING "
                         "RETURNING command_id",
-                        (command_id, common.jsonb({"status": "in_progress"})),
+                        (command_id, Jsonb({"status": "in_progress"})),
                     ).fetchone()
                     if claimed is None:
                         existing = connection.execute(
@@ -118,17 +184,17 @@ def apply_command(account_id: str, command_type: str, amount: Decimal, command_i
                         "INSERT INTO account_events "
                         "(account_id, event_version, event_id, event_type, payload) "
                         "VALUES (%s, %s, %s, %s, %s)",
-                        (account_id, version, event_id, command_type, common.jsonb(payload)),
+                        (account_id, version, event_id, command_type, Jsonb(payload)),
                     )
                     connection.execute(
                         "INSERT INTO account_outbox (aggregate_id, event_id, payload) "
                         "VALUES (%s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
-                        (account_id, event_id, common.jsonb(payload)),
+                        (account_id, event_id, Jsonb(payload)),
                     )
                     response = {"status": "applied", "event_id": event_id, "event_version": version}
                     connection.execute(
                         "UPDATE processed_commands SET response = %s WHERE command_id = %s",
-                        (common.jsonb(response), command_id),
+                        (Jsonb(response), command_id),
                     )
                     return response
         except psycopg.errors.UniqueViolation:
@@ -162,20 +228,68 @@ guard is used; the constraint decides the race.
 Run the relay in another terminal with `python relay.py`:
 
 ```python title="relay.py"
+import json
+import os
 import time
-import common
+from typing import Any
+
+import psycopg
+from confluent_kafka import Producer
+from psycopg.rows import dict_row
 
 TOPIC = "account_events"
 
 
+def connect_db():
+    # Long-lived connection for the polling loop.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: relay restarts can safely republish pending rows.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
+def publish_event(producer: Producer, topic: str, event: dict[str, Any]) -> None:
+    # Keyed produce + flush; raises on broker error so row stays pending.
+    errors: list[str] = []
+
+    def delivered(error: object, message: object) -> None:
+        if error is not None:
+            errors.append(str(error))
+
+    producer.produce(
+        topic,
+        key=str(event["aggregate_id"]).encode("utf-8"),
+        value=json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        callback=delivered,
+    )
+    remaining = producer.flush(15.0)
+    if remaining != 0:
+        raise TimeoutError(f"{remaining} record(s) undelivered")
+    if errors:
+        raise RuntimeError(errors[0])
+    producer.poll(0)
+
+
 def main() -> None:
-    producer = common.new_producer("p11-account-relay")
-    with common.connect() as connection:
+    # Poll outbox, publish each pending row, mark only after ack.
+    producer = new_producer("p11-account-relay")
+    with connect_db() as connection:
         while True:
             with connection.transaction():
+                # SKIP LOCKED lets a second relay take different rows.
                 rows = connection.execute("SELECT id, aggregate_id, payload FROM account_outbox WHERE published = FALSE ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED").fetchall()
                 for row in rows:
-                    common.publish(producer, TOPIC, row["payload"])
+                    publish_event(producer, TOPIC, row["payload"])
                 if rows:
                     connection.execute("UPDATE account_outbox SET published = TRUE WHERE id = ANY(%s)", ([row["id"] for row in rows],))
             time.sleep(0.1 if not rows else 0)
@@ -189,9 +303,17 @@ if __name__ == "__main__":
 
 ```python title="projector.py"
 import argparse
+import os
 from decimal import Decimal
 from typing import Any
-import common
+
+import psycopg
+from psycopg.rows import dict_row
+
+
+def connect_db():
+    # Postgres with dict rows for folding the event log.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
 
 
 def fold_account(connection: Any, account_id: str, from_version: int) -> tuple[Decimal, int]:
@@ -225,7 +347,7 @@ def fold_account(connection: Any, account_id: str, from_version: int) -> tuple[D
 
 
 def project_account(account_id: str) -> None:
-    with common.connect() as connection:
+    with connect_db() as connection:
         with connection.transaction():
             current = connection.execute(
                 "SELECT event_version FROM balance_view WHERE account_id = %s",
@@ -245,15 +367,15 @@ def project_account(account_id: str) -> None:
 
 
 def rebuild_full() -> None:
-    with common.connect() as connection:
+    with connect_db() as connection:
         accounts = connection.execute(
             "SELECT DISTINCT account_id FROM account_events ORDER BY account_id"
         ).fetchall()
     for row in accounts:
-        with common.connect() as connection:
+        with connect_db() as connection:
             with connection.transaction():
                 connection.execute("DELETE FROM balance_view WHERE account_id = %s", (row["account_id"],))
-        with common.connect() as connection:
+        with connect_db() as connection:
             with connection.transaction():
                 rows = connection.execute(
                     "SELECT event_type, payload, event_version FROM account_events "
@@ -308,22 +430,35 @@ start `balance` at `Decimal("0")`, never an undefined variable.
 import json
 import os
 from decimal import Decimal
+
+import psycopg
 from confluent_kafka import Consumer
-import common
+from psycopg.rows import dict_row
 
 TOPIC = "account_events"
 GROUP = "ledger-projector"
 
 
-def main() -> None:
-    consumer = Consumer(
+def connect_db():
+    # Per-message connection for the claim + projection transaction.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer; offset follows the projection transaction.
+    return Consumer(
         {
             "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
-            "group.id": GROUP,
+            "group.id": group_id,
             "auto.offset.reset": "earliest",
             "enable.auto.offset.commit": False,
         }
     )
+
+
+def main() -> None:
+    # Fold Kafka events into ledger_projection; claim makes replay safe.
+    consumer = new_consumer(GROUP)
     consumer.subscribe([TOPIC])
     try:
         while True:
@@ -332,21 +467,21 @@ def main() -> None:
                 continue
             if message.error() is not None:
                 raise RuntimeError(str(message.error()))
-            event = json.loads(message.value())
-            event_id = event["event_id"]
-            data = event["data"]
-            account_id = event["aggregate_id"]
+            event = json.loads(message.value())  # outbox envelope from relay
+            event_id = event["event_id"]  # dedup key
+            data = event["data"]  # delta + event_version live here
+            account_id = event["aggregate_id"]  # Kafka key + fold scope
             version = int(data["event_version"])
             delta = Decimal(str(data["delta"]))
-            with common.connect() as connection:
-                with connection.transaction():
+            with connect_db() as connection:
+                with connection.transaction():  # claim + fold = atomic
                     claimed = connection.execute(
                         "INSERT INTO processed_events (consumer_group, event_id) "
                         "VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) "
                         "DO NOTHING RETURNING event_id",
                         (GROUP, event_id),
                     ).fetchone()
-                    if claimed is None:
+                    if claimed is None:  # duplicate delivery
                         consumer.commit(message=message, asynchronous=False)
                         continue
                     previous = connection.execute(
@@ -355,7 +490,7 @@ def main() -> None:
                         (account_id,),
                     ).fetchone()
                     running = Decimal(str(previous["balance_after"])) if previous else Decimal("0")
-                    running += delta
+                    running += delta  # fold: apply signed delta
                     connection.execute(
                         "INSERT INTO ledger_projection "
                         "(account_id, event_version, event_id, delta, balance_after) "
@@ -363,7 +498,7 @@ def main() -> None:
                         "ON CONFLICT (account_id, event_version) DO NOTHING",
                         (account_id, version, event_id, delta, running),
                     )
-            consumer.commit(message=message, asynchronous=False)
+            consumer.commit(message=message, asynchronous=False)  # checkpoint
     finally:
         consumer.close()
 

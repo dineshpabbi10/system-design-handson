@@ -18,6 +18,14 @@ flowchart LR
     C -->|"invalid bytes"| D["orders.dead"]
 ```
 
+### How the flow works
+
+1. **The contract is two files.** `order-value.avsc` (`OrderPlaced`: `event_id, aggregate_id, customer_id, sku, quantity, amount_cents, currency [default USD], occurred_at`) is the enforced value schema. `order-key.avsc` (`OrderKey{order_id}`) is governance-only — the lab deliberately keeps the Kafka key as the UTF-8 `aggregate_id` string so per-order partitioning survives without Avro-key tooling. `event_id = order-{uuid}-placed` stays the dedup key; `aggregate_id = order_id` stays the partition key.
+2. **Register once, check compatibility on every change.** `POST /subjects/orders.events-value/versions` stores v1 and returns schema `id = 1`; `PUT /config/orders.events-value = BACKWARD` says "new data must be readable by old code". The serializer prepends that `id` to every record (the 5-byte wire header); the deserializer fetches the schema by `id` — the topic never carries the schema itself.
+3. **`producer.py`: validate, then publish.** `AvroSerializer(event)` fails fast if a required field is missing — the bad record never reaches Kafka. On success, `produce(key = order_id, value = Avro bytes) + flush` gives the same ack-then-continue guarantee as JSON projects, just with binary payloads.
+4. **`consumer.py`: deserialize, then decide.** Group `orders-avro-inventory` tries `AvroDeserializer`; corrupt bytes or a valid Avro record missing `event_id / aggregate_id` is a *contract breach*, not a transient error — it goes straight to `orders.dead` with `x-error-type = invalid` and the source offset commits so the partition keeps moving. Anything else claims `(group, event_id)` in `processed_events` (the only table here — this lab proves serde + dedup, not business state) and commits.
+5. **Evolution is a registry question, not a code deploy.** v2 adds `discount_cents: ["null","long"] default null` → `is_compatible: true` because old readers ignore the new field (it defaults to null). v3 drops `aggregate_id` and adds required `coupon` → `is_compatible: false`: old readers lose their routing/dedup key and new readers break on old records missing `coupon`. You check *before* registering; v3 is never registered.
+
 | Skill | Learned by |
 |-------|-----------|
 | Avro value + optional key schema | `order-value.avsc`, `order-key.avsc` |
@@ -26,15 +34,14 @@ flowchart LR
 | Incompatible rejection | v3 breaking change, `is_compatible: false` |
 | Contract breach handling | DLQ with `x-error-type=invalid` |
 
-## Shared files and setup
+## Files and setup
 
-Copy `compose.yaml` and `common.py` unchanged from
-[Setup](../01-fundamentals/setup.md). Add:
+Every file below is self-contained — no shared helper module. Copy `compose.yaml`
+from [Setup](../01-fundamentals/setup.md). Add:
 
 ```text
 compose.yaml
 compose.registry.yaml
-common.py
 requirements.txt
 schema.sql
 order-value.avsc
@@ -146,29 +153,45 @@ the v1 schema, and the config GET returns `{"compatibility":"BACKWARD"}`.
 ## 3. `producer.py`
 
 ```python title="producer.py"
+import os
 import uuid
+from confluent_kafka import Producer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import MessageField, SerializationContext
-import common
 
 TOPIC = "orders.events"
 
 
 def event_to_dict(event: dict, ctx: object) -> dict:
+    # Avro hook: pass through the dict; serializer validates against .avsc.
     return event
 
 
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer: safe to retry Avro publish after serialization.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
 def main() -> None:
+    # Load contract, init registry + serializer + producer, publish one event.
     with open("order-value.avsc", encoding="utf-8") as handle:
-        value_schema = handle.read()
+        value_schema = handle.read()  # local contract file
     registry = SchemaRegistryClient({"url": "http://localhost:8081"})
     serializer = AvroSerializer(registry, value_schema, event_to_dict)
-    producer = common.new_producer("p09-orders-producer")
+    producer = new_producer("p09-orders-producer")
     order_id = str(uuid.uuid4())
     event = {
-        "event_id": f"order-{order_id}-placed",
-        "aggregate_id": order_id,
+        "event_id": f"order-{order_id}-placed",  # stable id for dedup
+        "aggregate_id": order_id,  # also the Kafka key below
         "customer_id": "c-1",
         "sku": "sku-1",
         "quantity": 2,
@@ -176,21 +199,22 @@ def main() -> None:
         "currency": "USD",
         "occurred_at": "2026-01-01T00:00:00+00:00",
     }
-    context = SerializationContext(TOPIC, MessageField.VALUE)
-    value = serializer(event, context)
+    context = SerializationContext(TOPIC, MessageField.VALUE)  # value subject
+    value = serializer(event, context)  # validates + prepends schema-id header
     errors: list[str] = []
 
     def delivered(error: object, message: object) -> None:
+        # Async ack check; collected and raised after flush.
         if error is not None:
             errors.append(str(error))
 
     producer.produce(
         TOPIC,
-        key=order_id.encode("utf-8"),
-        value=value,
+        key=order_id.encode("utf-8"),  # per-order ordering key
+        value=value,  # Avro bytes, not JSON
         callback=delivered,
     )
-    remaining = producer.flush(15.0)
+    remaining = producer.flush(15.0)  # wait for broker ack
     if remaining != 0:
         raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
     if errors:
@@ -210,58 +234,84 @@ string so per-order ordering holds. `event_id` is stable for dedup.
 
 ```python title="consumer.py"
 import os
-from confluent_kafka import Consumer
+import psycopg
+from confluent_kafka import Consumer, Producer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
-import common
+from psycopg.rows import dict_row
 
 TOPIC = "orders.events"
 DEAD_TOPIC = "orders.dead"
 GROUP = "orders-avro-inventory"
 
 
+def connect_db():
+    # Postgres for the dedup claim; one connection per message.
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def new_consumer(group_id: str) -> Consumer:
+    # Manual-commit consumer; corrupt bytes still commit after DLQ handoff.
+    return Consumer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "group.id": group_id,
+            "auto.offset.reset": "earliest",
+            "enable.auto.offset.commit": False,
+        }
+    )
+
+
+def new_producer(client_id: str) -> Producer:
+    # Idempotent producer for the DLQ handoff.
+    return Producer(
+        {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "client.id": client_id,
+            "acks": "all",
+            "enable.idempotence": True,
+            "delivery.timeout.ms": 30000,
+        }
+    )
+
+
 def dict_from_avro(obj: dict | None, ctx: object) -> dict | None:
+    # Avro hook: return dict as-is for validation below.
     return obj
 
 
-def send_dead(producer: object, key: bytes | None, value: bytes) -> None:
+def send_dead(producer: Producer, key: bytes | None, value: bytes) -> None:
+    # DLQ handoff: corrupt bytes are deterministic poison, not retried.
     errors: list[str] = []
 
     def delivered(error: object, message: object) -> None:
         if error is not None:
             errors.append(str(error))
 
-    typed_producer = producer
-    typed_producer.produce(
+    producer.produce(
         DEAD_TOPIC,
         key=key,
         value=value,
         headers=[("x-error-type", b"invalid"), ("x-error-detail", b"avro-decode-failed")],
         callback=delivered,
     )
-    remaining = typed_producer.flush(15.0)
+    remaining = producer.flush(15.0)  # wait for DLQ ack before source commit
     if remaining != 0:
         raise TimeoutError(f"{remaining} Kafka record(s) remain undelivered")
     if errors:
         raise RuntimeError(errors[0])
-    typed_producer.poll(0)
+    producer.poll(0)
 
 
 def main() -> None:
+    # Init registry, deserializer, consumer, and DLQ producer explicitly.
     with open("order-value.avsc", encoding="utf-8") as handle:
         value_schema = handle.read()
     registry = SchemaRegistryClient({"url": "http://localhost:8081"})
     deserializer = AvroDeserializer(registry, value_schema, dict_from_avro)
-    consumer = Consumer(
-        {
-            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
-            "group.id": GROUP,
-            "auto.offset.reset": "earliest",
-            "enable.auto.offset.commit": False,
-        }
-    )
-    producer = common.new_producer("p09-dlq-producer")
+    consumer = new_consumer(GROUP)
+    producer = new_producer("p09-dlq-producer")
     consumer.subscribe([TOPIC])
     try:
         while True:
@@ -272,32 +322,32 @@ def main() -> None:
                 raise RuntimeError(str(message.error()))
             try:
                 context = SerializationContext(message.topic(), MessageField.VALUE)
-                event = deserializer(message.value(), context)
+                event = deserializer(message.value(), context)  # may raise on bad bytes
             except Exception:
                 raw = message.value() or b""
-                send_dead(producer, message.key(), raw)
-                consumer.commit(message=message, asynchronous=False)
+                send_dead(producer, message.key(), raw)  # poison -> DLQ
+                consumer.commit(message=message, asynchronous=False)  # keep partition moving
                 continue
-            if event is None:
+            if event is None:  # tombstone: nothing to claim
                 consumer.commit(message=message, asynchronous=False)
                 continue
             if not event.get("event_id") or not event.get("aggregate_id"):
                 raw = message.value() or b""
-                send_dead(producer, message.key(), raw)
+                send_dead(producer, message.key(), raw)  # contract breach -> DLQ
                 consumer.commit(message=message, asynchronous=False)
                 continue
-            with common.connect() as connection:
-                with connection.transaction():
+            with connect_db() as connection:
+                with connection.transaction():  # dedup claim is the processing step
                     claimed = connection.execute(
                         "INSERT INTO processed_events (consumer_group, event_id) "
                         "VALUES (%s, %s) ON CONFLICT (consumer_group, event_id) "
                         "DO NOTHING RETURNING event_id",
                         (GROUP, event["event_id"]),
                     ).fetchone()
-                    if claimed is None:
+                    if claimed is None:  # duplicate delivery
                         consumer.commit(message=message, asynchronous=False)
                         continue
-            consumer.commit(message=message, asynchronous=False)
+            consumer.commit(message=message, asynchronous=False)  # checkpoint
     finally:
         consumer.close()
 
